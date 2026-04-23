@@ -1,8 +1,10 @@
 const express = require("express");
 const cors = require("cors");
 const app = express();
+
 app.use(cors());
 app.use(express.json());
+
 const productTypeRoutes      = require("./routes/productType");
 const categoryRoutes         = require("./routes/category");
 const productRoutes          = require("./routes/product");
