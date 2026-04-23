@@ -94,7 +94,8 @@ app.use("/api/production-returns",  productionReturnInvoiceRoutes);
 app.use("/api/production-report",   productionReportRoutes);
 app.use("/api/permissions",         permissionsRoutes);
 
-const PORT = 5000;
+const PORT = process.env.PORT || 5000;
+
 app.listen(PORT, () => {
-  console.log(`Server chal raha hai: http://localhost:${PORT}`);
+  console.log(`Server chal raha hai port ${PORT}`);
 });
