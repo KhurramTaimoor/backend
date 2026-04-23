@@ -1,10 +1,21 @@
 const express = require("express");
 const cors = require("cors");
 const app = express();
+const pool = require("./db");
 
 app.use(cors());
 app.use(express.json());
-
+app.get("/db-test", async (req, res) => {
+  try {
+    const [rows] = await pool.query("SELECT 1 AS ok");
+    res.json({ success: true, rows });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      message: error.message,
+    });
+  }
+});
 const productTypeRoutes      = require("./routes/productType");
 const categoryRoutes         = require("./routes/category");
 const productRoutes          = require("./routes/product");
