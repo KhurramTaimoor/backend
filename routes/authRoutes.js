@@ -6,8 +6,8 @@ const router = express.Router();
 const adminUser = {
   id: 1,
   name: 'Admin',
-  email: 'admin@gmail.com',
-  password: '123456',
+  email: 'Alicage061@gmail.com',
+  password: 'Alicage123',
   role: 'admin',
 };
 
