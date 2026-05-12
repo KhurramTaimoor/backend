@@ -22,7 +22,13 @@ router.post('/login', (req, res) => {
       });
     }
 
-    if (email === adminUser.email && password === adminUser.password) {
+    const inputEmail = email.trim().toLowerCase();
+    const inputPassword = password.trim().toLowerCase();
+
+    const adminEmail = adminUser.email.trim().toLowerCase();
+    const adminPassword = adminUser.password.trim().toLowerCase();
+
+    if (inputEmail === adminEmail && inputPassword === adminPassword) {
       return res.json({
         success: true,
         message: 'Login successful',
