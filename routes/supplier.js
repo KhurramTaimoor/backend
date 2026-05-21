@@ -1,4 +1,4 @@
-﻿const express = require("express");
+const express = require("express");
 const router = express.Router();
 const db = require("../db");
 
@@ -11,9 +11,19 @@ function runQuery(sql, params = []) {
   });
 }
 
+function cleanMoney(value) {
+  const num = Number(value || 0);
+  return Number.isFinite(num) ? num : 0;
+}
+
 async function getSupplierById(id) {
   const rows = await runQuery(
-    `SELECT id, supplier_name, phone, created_at
+    `SELECT 
+       id, 
+       supplier_name, 
+       phone, 
+       COALESCE(opening_balance, 0) AS opening_balance,
+       created_at
      FROM suppliers
      WHERE id = ?`,
     [id]
@@ -26,13 +36,19 @@ async function getSupplierById(id) {
 router.get("/", async (req, res) => {
   try {
     const results = await runQuery(
-      `SELECT id, supplier_name, phone, created_at
+      `SELECT 
+         id, 
+         supplier_name, 
+         phone, 
+         COALESCE(opening_balance, 0) AS opening_balance,
+         created_at
        FROM suppliers
        ORDER BY id DESC`
     );
 
     res.json(results);
   } catch (err) {
+    console.error("Get suppliers error:", err);
     res.status(500).json({ message: err.message });
   }
 });
@@ -48,6 +64,7 @@ router.get("/:id", async (req, res) => {
 
     res.json({ data: supplier });
   } catch (err) {
+    console.error("Get supplier error:", err);
     res.status(500).json({ message: err.message });
   }
 });
@@ -58,6 +75,7 @@ router.post("/", async (req, res) => {
     const {
       supplier_name = "",
       phone = "",
+      opening_balance = 0,
     } = req.body;
 
     if (!supplier_name.trim()) {
@@ -65,11 +83,13 @@ router.post("/", async (req, res) => {
     }
 
     const result = await runQuery(
-      `INSERT INTO suppliers (supplier_name, phone)
-       VALUES (?, ?)`,
+      `INSERT INTO suppliers 
+        (supplier_name, phone, opening_balance)
+       VALUES (?, ?, ?)`,
       [
         supplier_name.trim(),
         phone.trim(),
+        cleanMoney(opening_balance),
       ]
     );
 
@@ -80,6 +100,7 @@ router.post("/", async (req, res) => {
       data: supplier,
     });
   } catch (err) {
+    console.error("Create supplier error:", err);
     res.status(500).json({ message: err.message });
   }
 });
@@ -90,6 +111,7 @@ router.put("/:id", async (req, res) => {
     const {
       supplier_name = "",
       phone = "",
+      opening_balance = 0,
     } = req.body;
 
     if (!supplier_name.trim()) {
@@ -97,17 +119,22 @@ router.put("/:id", async (req, res) => {
     }
 
     const existing = await getSupplierById(req.params.id);
+
     if (!existing) {
       return res.status(404).json({ message: "Supplier not found." });
     }
 
     await runQuery(
       `UPDATE suppliers
-       SET supplier_name = ?, phone = ?
+       SET 
+         supplier_name = ?, 
+         phone = ?,
+         opening_balance = ?
        WHERE id = ?`,
       [
         supplier_name.trim(),
         phone.trim(),
+        cleanMoney(opening_balance),
         req.params.id,
       ]
     );
@@ -119,6 +146,7 @@ router.put("/:id", async (req, res) => {
       data: updated,
     });
   } catch (err) {
+    console.error("Update supplier error:", err);
     res.status(500).json({ message: err.message });
   }
 });
@@ -127,6 +155,7 @@ router.put("/:id", async (req, res) => {
 router.delete("/:id", async (req, res) => {
   try {
     const existing = await getSupplierById(req.params.id);
+
     if (!existing) {
       return res.status(404).json({ message: "Supplier not found." });
     }
@@ -135,6 +164,7 @@ router.delete("/:id", async (req, res) => {
 
     res.json({ message: "Deleted!" });
   } catch (err) {
+    console.error("Delete supplier error:", err);
     res.status(500).json({ message: err.message });
   }
 });
