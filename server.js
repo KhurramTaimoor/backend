@@ -8,18 +8,23 @@ const allowedOrigins = [
   "https://www.alibirdcageofficial.store",
 ];
 
-app.use(cors({
+const corsOptions = {
   origin: function (origin, callback) {
     if (!origin) return callback(null, true);
-    if (allowedOrigins.includes(origin)) return callback(null, true);
+
+    if (allowedOrigins.includes(origin)) {
+      return callback(null, true);
+    }
+
     return callback(new Error("Not allowed by CORS"));
   },
   methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
   allowedHeaders: ["Content-Type", "Authorization"],
   credentials: true,
-}));
+};
 
-app.options("*", cors());
+app.use(cors(corsOptions));
+app.options("*", cors(corsOptions));
 app.use(express.json());
 
 app.get("/", (req, res) => {
@@ -30,31 +35,45 @@ app.get("/health", (req, res) => {
   res.json({ ok: true });
 });
 
+// ─────────────────────────────────────────────────────────────
+// ROUTES IMPORTS
+// ─────────────────────────────────────────────────────────────
+
 const productTypeRoutes = require("./routes/productType");
 const categoryRoutes = require("./routes/category");
 const productRoutes = require("./routes/product");
 const unitRoutes = require("./routes/unit");
+
 const openingStockRoutes = require("./routes/openingStock");
 const stockReceiveRoutes = require("./routes/stockReceive");
 const stockIssueRoutes = require("./routes/stockIssue");
+
+/* NEW ROUTES */
+const stockDemandRoutes = require("./routes/stockDemand");
+const productProfitLossReportRoutes = require("./routes/productProfitLossReport");
+
 const departmentRoutes = require("./routes/departments");
 const inventoryReportRoutes = require("./routes/inventoryReport");
 const productLedgerRoutes = require("./routes/productLedger");
+
 const customerRoutes = require("./routes/customer");
 const salesmanRoutes = require("./routes/salesman");
 const retailerRoutes = require("./routes/retailer");
 const areaRoutes = require("./routes/area");
+
 const salesRateRoutes = require("./routes/rates");
 const saleOrderRoutes = require("./routes/saleOrder");
 const salesInvoiceRoutes = require("./routes/salesInvoice");
 const salesReturnRoutes = require("./routes/salesReturn");
 const salesReportRoutes = require("./routes/salesReport");
+
 const supplierRoutes = require("./routes/supplier");
 const purchaseRateRoutes = require("./routes/purchaseRate");
 const purchaseInvoiceRoutes = require("./routes/purchaseInvoice");
 const purchaseReturnRoutes = require("./routes/purchaseReturn");
 const purchaseReportRoutes = require("./routes/purchaseReport");
 const supplierLedgerRoutes = require("./routes/supplierLedger");
+
 const accountGroupsRoutes = require("./routes/accountGroups");
 const chartOfAccountsRoutes = require("./routes/chartOfAccounts");
 const journalVoucherRoutes = require("./routes/journalVoucher");
@@ -62,46 +81,64 @@ const cashBookRoutes = require("./routes/cashBook");
 const openingBalanceRoutes = require("./routes/openingBalance");
 const generalLedgerRoutes = require("./routes/generalLedger");
 const cashBookReportRoutes = require("./routes/cashBookReport");
+
 const employeesRoutes = require("./routes/employees");
 const employeeRatesRoutes = require("./routes/employeeRates");
 const hrReportsRoutes = require("./routes/hrReports");
 const employeeLedgerRoutes = require("./routes/employeeLedger");
+
 const bomRoutes = require("./routes/bom");
 const assemblyRoutes = require("./routes/assembly");
 const productionInvoiceRoutes = require("./routes/productionInvoice");
 const productionReportRoutes = require("./routes/productionReport");
 const productionReturnInvoiceRoutes = require("./routes/productionReturnInvoice");
+
 const permissionsRoutes = require("./routes/permissions");
 const LedgerRoutes = require("./routes/LedgerRoutes");
 const authRoutes = require("./routes/authRoutes");
 
+// ─────────────────────────────────────────────────────────────
+// ROUTES USE
+// ─────────────────────────────────────────────────────────────
+
 app.use("/api/ledger", LedgerRoutes);
 app.use("/api/auth", authRoutes);
+
 app.use("/api/product-types", productTypeRoutes);
 app.use("/api/categories", categoryRoutes);
 app.use("/api/products", productRoutes);
 app.use("/api/units", unitRoutes);
+
 app.use("/api/opening-stock", openingStockRoutes);
 app.use("/api/stock-receive", stockReceiveRoutes);
 app.use("/api/stock-issue", stockIssueRoutes);
+
+/* NEW API ENDPOINTS */
+app.use("/api/stock-demand", stockDemandRoutes);
+app.use("/api/reports/product-profit-loss", productProfitLossReportRoutes);
+
 app.use("/api/departments", departmentRoutes);
 app.use("/api/inventory-report", inventoryReportRoutes);
 app.use("/api/product-ledger", productLedgerRoutes);
+
 app.use("/api/customers", customerRoutes);
 app.use("/api/salesmen", salesmanRoutes);
 app.use("/api/retailers", retailerRoutes);
 app.use("/api/areas", areaRoutes);
+
 app.use("/api/rates", salesRateRoutes);
 app.use("/api/sale-orders", saleOrderRoutes);
 app.use("/api/sales-invoices", salesInvoiceRoutes);
 app.use("/api/sales-returns", salesReturnRoutes);
 app.use("/api/sales-report", salesReportRoutes);
+
 app.use("/api/suppliers", supplierRoutes);
 app.use("/api/purchase-rates", purchaseRateRoutes);
 app.use("/api/purchase-invoices", purchaseInvoiceRoutes);
 app.use("/api/purchase-returns", purchaseReturnRoutes);
 app.use("/api/purchase-report", purchaseReportRoutes);
 app.use("/api/supplier-ledger", supplierLedgerRoutes);
+
 app.use("/api/account-groups", accountGroupsRoutes);
 app.use("/api/chart-of-accounts", chartOfAccountsRoutes);
 app.use("/api/journal-vouchers", journalVoucherRoutes);
@@ -109,24 +146,36 @@ app.use("/api/cash-book", cashBookRoutes);
 app.use("/api/opening-balances", openingBalanceRoutes);
 app.use("/api/general-ledger", generalLedgerRoutes);
 app.use("/api/cash-book-report", cashBookReportRoutes);
+
 app.use("/api/employees", employeesRoutes);
 app.use("/api/employee-rates", employeeRatesRoutes);
 app.use("/api/hr-reports", hrReportsRoutes);
 app.use("/api/employee-ledger", employeeLedgerRoutes);
+
 app.use("/api/bom", bomRoutes);
 app.use("/api/assembly", assemblyRoutes);
 app.use("/api/production-invoices", productionInvoiceRoutes);
 app.use("/api/production-returns", productionReturnInvoiceRoutes);
 app.use("/api/production-report", productionReportRoutes);
+
 app.use("/api/permissions", permissionsRoutes);
+
+// ─────────────────────────────────────────────────────────────
+// GLOBAL ERROR HANDLER
+// ─────────────────────────────────────────────────────────────
 
 app.use((err, req, res, next) => {
   console.error("Global error:", err);
+
   res.status(500).json({
     success: false,
     message: err.message || "Server error",
   });
 });
+
+// ─────────────────────────────────────────────────────────────
+// SERVER
+// ─────────────────────────────────────────────────────────────
 
 const PORT = process.env.PORT || 5000;
 
