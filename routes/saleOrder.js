@@ -65,6 +65,141 @@ const normalizeItems = (items = []) => {
     .filter((item) => item.product_id > 0 && item.order_qty > 0);
 };
 
+const directBalanceKeys = [
+  "previous_balance",
+  "previousBalance",
+  "prev_balance",
+  "prevBalance",
+  "opening_balance",
+  "openingBalance",
+  "balance",
+  "current_balance",
+  "currentBalance",
+  "closing_balance",
+  "closingBalance",
+  "ledger_balance",
+  "ledgerBalance",
+  "account_balance",
+  "accountBalance",
+  "old_balance",
+  "oldBalance",
+  "remaining_balance",
+  "remainingBalance",
+  "due_balance",
+  "dueBalance",
+  "payable",
+  "receivable",
+];
+
+const getRecordId = (row) =>
+  row?.id ??
+  row?.value ??
+  row?.customer_id ??
+  row?.employee_id ??
+  row?.supplier_id ??
+  row?.general_ledger_id ??
+  row?.ledger_id ??
+  row?.account_id ??
+  "";
+
+const getDirectPreviousBalance = (row) => {
+  if (!row) return 0;
+
+  for (const key of directBalanceKeys) {
+    if (row[key] !== undefined && row[key] !== null && String(row[key]).trim() !== "") {
+      return toNum(row[key]);
+    }
+  }
+
+  const debit = toNum(row.debit || row.total_debit || row.debit_amount || row.dr || row.total_dr);
+  const credit = toNum(row.credit || row.total_credit || row.credit_amount || row.cr || row.total_cr);
+  if (debit || credit) return debit - credit;
+
+  return 0;
+};
+
+const balanceMapKey = (partyType, partyId) => `${partyType}:${partyId}`;
+
+function addToBalanceMap(map, partyType, partyId, amount) {
+  const id = Number(partyId);
+  if (!Number.isFinite(id) || id <= 0) return;
+  const key = balanceMapKey(partyType, id);
+  map[key] = toNum(map[key]) + toNum(amount);
+}
+
+async function getSaleOrderBalanceMap() {
+  await ensureSaleOrderSchema();
+
+  const map = {};
+  const balanceExpr = `
+    CASE
+      WHEN remaining_balance IS NOT NULL THEN remaining_balance
+      WHEN grand_total IS NOT NULL THEN (grand_total - IFNULL(paid_amount, 0))
+      WHEN total_amount IS NOT NULL THEN (total_amount - IFNULL(paid_amount, 0))
+      ELSE 0
+    END
+  `;
+
+  const byParty = await runQuery(
+    `SELECT party_type, party_id, SUM(${balanceExpr}) AS balance
+     FROM sale_orders
+     WHERE party_id IS NOT NULL AND party_id > 0
+     GROUP BY party_type, party_id`
+  ).catch(() => []);
+
+  byParty.forEach((row) => {
+    const type = normalizePartyType(row.party_type || "customer");
+    addToBalanceMap(map, type, row.party_id, row.balance);
+  });
+
+  const legacyGroups = [
+    { type: "customer", column: "customer_id" },
+    { type: "employee", column: "employee_id" },
+    { type: "supplier", column: "supplier_id" },
+    { type: "general_ledger", column: "general_ledger_id" },
+  ];
+
+  for (const group of legacyGroups) {
+    const rows = await runQuery(
+      `SELECT ${group.column} AS id, SUM(${balanceExpr}) AS balance
+       FROM sale_orders
+       WHERE ${group.column} IS NOT NULL AND ${group.column} > 0
+       GROUP BY ${group.column}`
+    ).catch(() => []);
+
+    rows.forEach((row) => addToBalanceMap(map, group.type, row.id, row.balance));
+  }
+
+  return map;
+}
+
+function attachPreviousBalance(list, partyType, balanceMap) {
+  return (Array.isArray(list) ? list : []).map((row) => {
+    const id = getRecordId(row);
+    const directBalance = getDirectPreviousBalance(row);
+    const saleOrderBalance = toNum(balanceMap[balanceMapKey(partyType, id)]);
+    const previousBalance = directBalance !== 0 ? directBalance : saleOrderBalance;
+
+    return {
+      ...row,
+      previous_balance: previousBalance,
+      previousBalance,
+      balance: previousBalance,
+      current_balance: previousBalance,
+      remaining_balance: previousBalance,
+    };
+  });
+}
+
+async function getPreviousBalanceForParty(partyType, partyId) {
+  const type = normalizePartyType(partyType);
+  const id = Number(partyId);
+  if (!Number.isFinite(id) || id <= 0) return 0;
+
+  const balanceMap = await getSaleOrderBalanceMap();
+  return toNum(balanceMap[balanceMapKey(type, id)]);
+}
+
 async function columnExists(tableName, columnName) {
   const rows = await runQuery(
     `SELECT COUNT(*) AS total
@@ -193,6 +328,7 @@ async function getDropdownData() {
     employees,
     suppliers,
     generalLedgers,
+    balanceMap,
   ] = await Promise.all([
     runQuery(`SELECT * FROM categories ORDER BY id DESC`).catch(() => []),
     runQuery(`SELECT * FROM units ORDER BY id DESC`).catch(() => []),
@@ -202,6 +338,7 @@ async function getDropdownData() {
     runQuery(`SELECT * FROM employees ORDER BY id DESC`).catch(() => []),
     runQuery(`SELECT * FROM suppliers ORDER BY id DESC`).catch(() => []),
     runQuery(`SELECT * FROM general_ledgers ORDER BY id DESC`).catch(() => []),
+    getSaleOrderBalanceMap().catch(() => ({})),
   ]);
 
   return {
@@ -209,10 +346,10 @@ async function getDropdownData() {
     units,
     products,
     product_types: productTypes,
-    customers,
-    employees,
-    suppliers,
-    general_ledgers: generalLedgers,
+    customers: attachPreviousBalance(customers, "customer", balanceMap),
+    employees: attachPreviousBalance(employees, "employee", balanceMap),
+    suppliers: attachPreviousBalance(suppliers, "supplier", balanceMap),
+    general_ledgers: attachPreviousBalance(generalLedgers, "general_ledger", balanceMap),
   };
 }
 
@@ -391,6 +528,32 @@ router.get("/", async (req, res) => {
     });
   } catch (err) {
     console.error("❌ GET /sale-orders:", err.message);
+    res.status(500).json({ message: err.message });
+  }
+});
+
+// GET /api/sale-orders/previous-balance/:partyType/:partyId
+router.get("/previous-balance/:partyType/:partyId", async (req, res) => {
+  try {
+    const partyType = normalizePartyType(req.params.partyType);
+    const partyId = Number(req.params.partyId);
+
+    if (!partyId || partyId <= 0) {
+      return res.status(400).json({ message: "Valid party id zaroori hai." });
+    }
+
+    const previousBalance = await getPreviousBalanceForParty(partyType, partyId);
+
+    res.json({
+      success: true,
+      party_type: partyType,
+      party_id: partyId,
+      previous_balance: previousBalance,
+      previousBalance,
+      balance: previousBalance,
+    });
+  } catch (err) {
+    console.error("❌ GET /sale-orders/previous-balance:", err.message);
     res.status(500).json({ message: err.message });
   }
 });
