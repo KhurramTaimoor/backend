@@ -56,6 +56,13 @@ const normalizeItems = (items = []) => {
       product_type_id: toNum(item.product_type_id),
       category_id: toNum(item.category_id),
       product_id: toNum(item.product_id),
+      product_description: cleanText(
+        item.product_description ||
+          item.description ||
+          item.product_desc ||
+          item.desc ||
+          ""
+      ),
       unit_id: toNum(item.unit_id),
       order_qty: toNum(item.order_qty ?? item.qty ?? item.quantity),
       rate: toNum(item.rate),
@@ -219,6 +226,47 @@ async function ensureColumn(tableName, columnName, definition) {
   await runQuery(`ALTER TABLE \`${tableName}\` ADD COLUMN ${definition}`);
 }
 
+async function getTableColumns(tableName) {
+  const rows = await runQuery(
+    `SELECT COLUMN_NAME
+     FROM INFORMATION_SCHEMA.COLUMNS
+     WHERE TABLE_SCHEMA = DATABASE()
+       AND TABLE_NAME = ?`,
+    [tableName]
+  );
+
+  return rows.map((row) => row.COLUMN_NAME);
+}
+
+async function ensureFmsProductType() {
+  const columns = await getTableColumns("product_types").catch(() => []);
+  if (!columns.length) return;
+
+  const nameColumn = [
+    "product_type_en",
+    "product_type",
+    "type_name",
+    "name",
+    "name_en",
+    "title",
+  ].find((column) => columns.includes(column));
+
+  if (!nameColumn) return;
+
+  const existing = await runQuery(
+    `SELECT id FROM product_types WHERE UPPER(TRIM(\`${nameColumn}\`)) = 'FMS' LIMIT 1`
+  ).catch(() => []);
+
+  if (existing.length) return;
+
+  await runQuery(
+    `INSERT INTO product_types (\`${nameColumn}\`) VALUES (?)`,
+    ["FMS"]
+  ).catch((err) => {
+    console.warn("⚠️ FMS product type auto insert skipped:", err.message);
+  });
+}
+
 let schemaReadyPromise = null;
 
 function ensureSaleOrderSchema() {
@@ -240,10 +288,16 @@ function ensureSaleOrderSchema() {
     await ensureColumn("sale_orders", "discount", "`discount` DECIMAL(18,2) NOT NULL DEFAULT 0 AFTER `delivery_charges`");
     await ensureColumn("sale_orders", "grand_total", "`grand_total` DECIMAL(18,2) NOT NULL DEFAULT 0 AFTER `total_amount`");
     await ensureColumn("sale_orders", "payment_method", "`payment_method` VARCHAR(50) NOT NULL DEFAULT 'Cash' AFTER `grand_total`");
-    await ensureColumn("sale_orders", "paid_amount", "`paid_amount` DECIMAL(18,2) NOT NULL DEFAULT 0 AFTER `payment_method`");
+    await ensureColumn("sale_orders", "advance_receive", "`advance_receive` DECIMAL(18,2) NOT NULL DEFAULT 0 AFTER `payment_method`");
+    await ensureColumn("sale_orders", "payment_received", "`payment_received` DECIMAL(18,2) NOT NULL DEFAULT 0 AFTER `advance_receive`");
+    await ensureColumn("sale_orders", "paid_amount", "`paid_amount` DECIMAL(18,2) NOT NULL DEFAULT 0 AFTER `payment_received`");
     await ensureColumn("sale_orders", "remaining_balance", "`remaining_balance` DECIMAL(18,2) NOT NULL DEFAULT 0 AFTER `paid_amount`");
     await ensureColumn("sale_orders", "payment_status", "`payment_status` VARCHAR(30) NOT NULL DEFAULT 'Unpaid' AFTER `remaining_balance`");
     await ensureColumn("sale_orders", "payment_note", "`payment_note` VARCHAR(255) NULL AFTER `payment_status`");
+
+    await ensureColumn("sale_order_items", "product_description", "`product_description` VARCHAR(500) NULL AFTER `product_id`");
+
+    await ensureFmsProductType();
   })();
 
   return schemaReadyPromise;
@@ -272,7 +326,21 @@ function buildOrderPayload(body) {
     totalAmount + previousBalance + deliveryCharges - discount
   );
 
-  const paidAmount = toNum(body.paid_amount);
+  const advanceReceive = toNum(
+    body.advance_receive ??
+      body.advanceReceive ??
+      body.paid_amount ??
+      0
+  );
+
+  const paymentReceived = toNum(
+    body.payment_received ??
+      body.paymentReceived ??
+      body.paid_amount ??
+      advanceReceive
+  );
+
+  const paidAmount = paymentReceived || advanceReceive || toNum(body.paid_amount);
 
   const remainingBalance = Math.max(
     0,
@@ -309,6 +377,8 @@ function buildOrderPayload(body) {
     grand_total: grandTotal,
 
     payment_method: normalizePaymentMethod(body.payment_method),
+    advance_receive: advanceReceive,
+    payment_received: paymentReceived,
     paid_amount: paidAmount,
     remaining_balance: remainingBalance,
     payment_status: paymentStatus,
@@ -380,6 +450,8 @@ async function getOrderById(id) {
           total_amount,
           grand_total,
           payment_method,
+          advance_receive,
+          payment_received,
           paid_amount,
           remaining_balance,
           payment_status,
@@ -396,6 +468,7 @@ async function getOrderById(id) {
           product_type_id,
           category_id,
           product_id,
+          product_description,
           unit_id,
           order_qty,
           rate,
@@ -422,13 +495,14 @@ async function insertOrderItems(orderId, validItems) {
     validItems.map((item) =>
       runQuery(
         `INSERT INTO sale_order_items
-         (order_id, product_type_id, category_id, product_id, unit_id, order_qty, rate, debit, credit)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+         (order_id, product_type_id, category_id, product_id, product_description, unit_id, order_qty, rate, debit, credit)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         [
           orderId,
           item.product_type_id,
           item.category_id,
           item.product_id,
+          item.product_description,
           item.unit_id,
           item.order_qty,
           item.rate,
@@ -470,6 +544,8 @@ router.get("/", async (req, res) => {
           total_amount,
           grand_total,
           payment_method,
+          advance_receive,
+          payment_received,
           paid_amount,
           remaining_balance,
           payment_status,
@@ -497,6 +573,7 @@ router.get("/", async (req, res) => {
           product_type_id,
           category_id,
           product_id,
+          product_description,
           unit_id,
           order_qty,
           rate,
@@ -619,13 +696,15 @@ router.post("/", async (req, res) => {
          total_amount,
          grand_total,
          payment_method,
+         advance_receive,
+         payment_received,
          paid_amount,
          remaining_balance,
          payment_status,
          payment_note,
          status
        )
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         payload.order_no,
         payload.reference_no,
@@ -647,6 +726,8 @@ router.post("/", async (req, res) => {
         payload.total_amount,
         payload.grand_total,
         payload.payment_method,
+        payload.advance_receive,
+        payload.payment_received,
         payload.paid_amount,
         payload.remaining_balance,
         payload.payment_status,
@@ -718,6 +799,8 @@ router.put("/:id", async (req, res) => {
          total_amount = ?,
          grand_total = ?,
          payment_method = ?,
+         advance_receive = ?,
+         payment_received = ?,
          paid_amount = ?,
          remaining_balance = ?,
          payment_status = ?,
@@ -745,6 +828,8 @@ router.put("/:id", async (req, res) => {
         payload.total_amount,
         payload.grand_total,
         payload.payment_method,
+        payload.advance_receive,
+        payload.payment_received,
         payload.paid_amount,
         payload.remaining_balance,
         payload.payment_status,
