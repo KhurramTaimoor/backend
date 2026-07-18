@@ -6,10 +6,15 @@ const allowedOrigins = [
   "https://app.alibirdcageofficial.store",
   "https://alibirdcageofficial.store",
   "https://www.alibirdcageofficial.store",
+
+  // Local frontend testing
+  "http://localhost:5173",
+  "http://127.0.0.1:5173",
 ];
 
 const corsOptions = {
   origin: function (origin, callback) {
+    // Postman, mobile apps aur server-to-server requests allow
     if (!origin) return callback(null, true);
 
     if (allowedOrigins.includes(origin)) {
@@ -18,6 +23,7 @@ const corsOptions = {
 
     return callback(new Error("Not allowed by CORS"));
   },
+
   methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
   allowedHeaders: ["Content-Type", "Authorization"],
   credentials: true,
@@ -50,7 +56,9 @@ const stockIssueRoutes = require("./routes/stockIssue");
 
 /* NEW ROUTES */
 const stockDemandRoutes = require("./routes/stockDemand");
-const productProfitLossReportRoutes = require("./routes/productProfitLossReport");
+const productProfitLossReportRoutes = require(
+  "./routes/productProfitLossReport"
+);
 
 const departmentRoutes = require("./routes/departments");
 const inventoryReportRoutes = require("./routes/inventoryReport");
@@ -91,11 +99,16 @@ const bomRoutes = require("./routes/bom");
 const assemblyRoutes = require("./routes/assembly");
 const productionInvoiceRoutes = require("./routes/productionInvoice");
 const productionReportRoutes = require("./routes/productionReport");
-const productionReturnInvoiceRoutes = require("./routes/productionReturnInvoice");
+const productionReturnInvoiceRoutes = require(
+  "./routes/productionReturnInvoice"
+);
 
 const permissionsRoutes = require("./routes/permissions");
 const LedgerRoutes = require("./routes/LedgerRoutes");
 const authRoutes = require("./routes/authRoutes");
+
+/* ALL LEDGER SUMMARY */
+const allLedgerSummaryRoutes = require("./routes/allLedgerSummary");
 
 // ─────────────────────────────────────────────────────────────
 // ROUTES USE
@@ -115,7 +128,10 @@ app.use("/api/stock-issue", stockIssueRoutes);
 
 /* NEW API ENDPOINTS */
 app.use("/api/stock-demand", stockDemandRoutes);
-app.use("/api/reports/product-profit-loss", productProfitLossReportRoutes);
+app.use(
+  "/api/reports/product-profit-loss",
+  productProfitLossReportRoutes
+);
 
 app.use("/api/departments", departmentRoutes);
 app.use("/api/inventory-report", inventoryReportRoutes);
@@ -160,12 +176,33 @@ app.use("/api/production-report", productionReportRoutes);
 
 app.use("/api/permissions", permissionsRoutes);
 
+/* ALL LEDGER SUMMARY ENDPOINT */
+app.use("/api/ledger-summary", allLedgerSummaryRoutes);
+
+// ─────────────────────────────────────────────────────────────
+// 404 HANDLER
+// ─────────────────────────────────────────────────────────────
+
+app.use((req, res) => {
+  res.status(404).json({
+    success: false,
+    message: `Route not found: ${req.method} ${req.originalUrl}`,
+  });
+});
+
 // ─────────────────────────────────────────────────────────────
 // GLOBAL ERROR HANDLER
 // ─────────────────────────────────────────────────────────────
 
 app.use((err, req, res, next) => {
   console.error("Global error:", err);
+
+  if (err.message === "Not allowed by CORS") {
+    return res.status(403).json({
+      success: false,
+      message: "This frontend origin is not allowed by CORS.",
+    });
+  }
 
   res.status(500).json({
     success: false,
