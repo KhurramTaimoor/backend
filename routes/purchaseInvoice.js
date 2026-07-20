@@ -3,17 +3,29 @@ const router = express.Router();
 const db = require("../db");
 
 /*
- * Purchase Invoice Route
- * - Existing purchase_invoices / purchase_invoice_items schema compatible
- * - SalesInvoicePage-style payload compatible
- * - Supplier only
- * - Shipment field intentionally ignored
- */
+|--------------------------------------------------------------------------
+| Purchase Invoice Route
+|--------------------------------------------------------------------------
+| Supports:
+| - Purchase Invoice create, list, details, update and delete
+| - Supplier selection
+| - Multiple products
+| - SalesInvoicePage-style payload
+| - Automatic unique invoice number
+| - Duplicate invoice number protection
+| - Bulk print data
+| - No Shipment / Ship To field
+|--------------------------------------------------------------------------
+*/
 
-const runQuery = (connection, sql, params = []) =>
+const query = (connection, sql, params = []) =>
   new Promise((resolve, reject) => {
     connection.query(sql, params, (error, result) => {
-      if (error) return reject(error);
+      if (error) {
+        reject(error);
+        return;
+      }
+
       resolve(result);
     });
   });
@@ -21,16 +33,25 @@ const runQuery = (connection, sql, params = []) =>
 const getConnection = () =>
   new Promise((resolve, reject) => {
     if (typeof db.getConnection !== "function") {
-      resolve({ connection: db, release: () => {} });
+      resolve({
+        connection: db,
+        release: () => {},
+      });
       return;
     }
 
     db.getConnection((error, connection) => {
-      if (error) return reject(error);
+      if (error) {
+        reject(error);
+        return;
+      }
+
       resolve({
         connection,
         release: () => {
-          if (typeof connection.release === "function") connection.release();
+          if (typeof connection.release === "function") {
+            connection.release();
+          }
         },
       });
     });
@@ -38,74 +59,362 @@ const getConnection = () =>
 
 const beginTransaction = (connection) =>
   new Promise((resolve, reject) => {
-    if (typeof connection.beginTransaction !== "function") return resolve();
+    if (typeof connection.beginTransaction !== "function") {
+      resolve();
+      return;
+    }
+
     connection.beginTransaction((error) => {
-      if (error) return reject(error);
+      if (error) {
+        reject(error);
+        return;
+      }
+
       resolve();
     });
   });
 
-const commit = (connection) =>
+const commitTransaction = (connection) =>
   new Promise((resolve, reject) => {
-    if (typeof connection.commit !== "function") return resolve();
+    if (typeof connection.commit !== "function") {
+      resolve();
+      return;
+    }
+
     connection.commit((error) => {
-      if (error) return reject(error);
+      if (error) {
+        reject(error);
+        return;
+      }
+
       resolve();
     });
   });
 
-const rollback = (connection) =>
+const rollbackTransaction = (connection) =>
   new Promise((resolve) => {
-    if (typeof connection.rollback !== "function") return resolve();
+    if (typeof connection.rollback !== "function") {
+      resolve();
+      return;
+    }
+
     connection.rollback(() => resolve());
   });
 
-async function withTransaction(work) {
+async function withTransaction(callback) {
   const { connection, release } = await getConnection();
 
   try {
     await beginTransaction(connection);
-    const result = await work(connection);
-    await commit(connection);
+
+    const result = await callback(connection);
+
+    await commitTransaction(connection);
+
     return result;
   } catch (error) {
-    await rollback(connection);
+    await rollbackTransaction(connection);
     throw error;
   } finally {
     release();
   }
 }
 
+const cleanText = (value) => String(value ?? "").trim();
+
 const toNumber = (value, fallback = 0) => {
-  const parsed = Number(value);
-  return Number.isFinite(parsed) ? parsed : fallback;
+  if (value === "" || value === null || value === undefined) {
+    return fallback;
+  }
+
+  const parsedValue = Number(value);
+
+  return Number.isFinite(parsedValue)
+    ? parsedValue
+    : fallback;
 };
 
 const toPositiveId = (value) => {
-  const parsed = Number(value);
-  return Number.isInteger(parsed) && parsed > 0 ? parsed : null;
-};
+  const parsedValue = Number(value);
 
-const cleanText = (value) => String(value ?? "").trim();
+  return Number.isInteger(parsedValue) && parsedValue > 0
+    ? parsedValue
+    : null;
+};
 
 const toDate = (value) => {
   if (!value) return null;
-  const text = String(value).slice(0, 10);
-  return /^\d{4}-\d{2}-\d{2}$/.test(text) ? text : null;
+
+  const formattedDate = String(value).slice(0, 10);
+
+  return /^\d{4}-\d{2}-\d{2}$/.test(formattedDate)
+    ? formattedDate
+    : null;
 };
 
 const firstDefined = (...values) =>
-  values.find((value) => value !== undefined && value !== null && value !== "");
+  values.find(
+    (value) =>
+      value !== undefined &&
+      value !== null &&
+      value !== ""
+  );
+
+/*
+|--------------------------------------------------------------------------
+| Invoice Number Helpers
+|--------------------------------------------------------------------------
+*/
+
+function normalizePurchaseInvoiceNo(value) {
+  return cleanText(value).replace(
+    /^sales-invoice/i,
+    "purchase-invoice"
+  );
+}
+
+async function invoiceNumberExists(
+  connection,
+  invoiceNo,
+  excludeInvoiceId = null
+) {
+  let sql = `
+    SELECT id
+    FROM purchase_invoices
+    WHERE LOWER(TRIM(invoice_no)) = LOWER(TRIM(?))
+  `;
+
+  const params = [invoiceNo];
+
+  if (excludeInvoiceId) {
+    sql += " AND id <> ?";
+    params.push(excludeInvoiceId);
+  }
+
+  sql += " LIMIT 1";
+
+  const rows = await query(connection, sql, params);
+
+  return rows.length > 0;
+}
+
+function splitInvoiceNumber(value) {
+  const normalizedValue =
+    normalizePurchaseInvoiceNo(value) ||
+    "purchase-invoice01";
+
+  const match = normalizedValue.match(
+    /^(.*?)(\d+)$/
+  );
+
+  if (!match) {
+    return {
+      prefix: "purchase-invoice",
+      currentNumber: 1,
+      width: 2,
+    };
+  }
+
+  return {
+    prefix: match[1] || "purchase-invoice",
+    currentNumber: Number(match[2]) || 1,
+    width: Math.max(match[2].length, 2),
+  };
+}
+
+async function getUniqueInvoiceNumber(
+  connection,
+  requestedInvoiceNo = "purchase-invoice01",
+  excludeInvoiceId = null
+) {
+  const normalizedRequestedNo =
+    normalizePurchaseInvoiceNo(requestedInvoiceNo);
+
+  if (
+    normalizedRequestedNo &&
+    !(await invoiceNumberExists(
+      connection,
+      normalizedRequestedNo,
+      excludeInvoiceId
+    ))
+  ) {
+    return normalizedRequestedNo;
+  }
+
+  const parsedNumber = splitInvoiceNumber(
+    normalizedRequestedNo
+  );
+
+  const existingRows = await query(
+    connection,
+    `
+      SELECT invoice_no
+      FROM purchase_invoices
+      WHERE invoice_no IS NOT NULL
+    `
+  );
+
+  let maximumNumber = 0;
+  let numberWidth = parsedNumber.width;
+
+  for (const row of existingRows) {
+    const invoiceNo = normalizePurchaseInvoiceNo(
+      row.invoice_no
+    );
+
+    const match = invoiceNo.match(/^(.*?)(\d+)$/);
+
+    if (!match) continue;
+
+    const existingPrefix = match[1];
+    const existingNumber = Number(match[2]) || 0;
+
+    if (
+      existingPrefix.toLowerCase() !==
+      parsedNumber.prefix.toLowerCase()
+    ) {
+      continue;
+    }
+
+    maximumNumber = Math.max(
+      maximumNumber,
+      existingNumber
+    );
+
+    numberWidth = Math.max(
+      numberWidth,
+      match[2].length
+    );
+  }
+
+  const nextNumber = Math.max(
+    maximumNumber + 1,
+    parsedNumber.currentNumber + 1
+  );
+
+  return `${parsedNumber.prefix}${String(
+    nextNumber
+  ).padStart(numberWidth, "0")}`;
+}
+
+/*
+|--------------------------------------------------------------------------
+| Supplier Helpers
+|--------------------------------------------------------------------------
+*/
+
+async function getSupplierById(connection, supplierId) {
+  if (!supplierId) return null;
+
+  const rows = await query(
+    connection,
+    `
+      SELECT *
+      FROM suppliers
+      WHERE id = ?
+      LIMIT 1
+    `,
+    [supplierId]
+  );
+
+  return rows[0] || null;
+}
+
+function getSupplierName(supplier) {
+  if (!supplier) return "";
+
+  return cleanText(
+    supplier.supplier_name ||
+      supplier.supplier_name_en ||
+      supplier.name ||
+      supplier.name_en ||
+      supplier.company_name
+  );
+}
+
+async function resolveSupplier(connection, body = {}) {
+  let supplierId = toPositiveId(
+    body.supplier_id ||
+      (
+        cleanText(
+          body.party_type ||
+            body.customer_type
+        ).toLowerCase() === "supplier"
+          ? body.party_id
+          : null
+      )
+  );
+
+  let supplierName = cleanText(
+    body.supplier_name ||
+      body.party_name ||
+      body.customer_name_en ||
+      body.customer_name ||
+      body.name
+  );
+
+  if (supplierId && !supplierName) {
+    const supplier = await getSupplierById(
+      connection,
+      supplierId
+    );
+
+    supplierName = getSupplierName(supplier);
+  }
+
+  if (!supplierId && supplierName) {
+    const rows = await query(
+      connection,
+      `
+        SELECT *
+        FROM suppliers
+        WHERE LOWER(TRIM(supplier_name)) =
+              LOWER(TRIM(?))
+        LIMIT 1
+      `,
+      [supplierName]
+    ).catch(() => []);
+
+    if (rows[0]) {
+      supplierId = rows[0].id;
+      supplierName =
+        getSupplierName(rows[0]) || supplierName;
+    }
+  }
+
+  return {
+    supplierId,
+    supplierName,
+  };
+}
+
+/*
+|--------------------------------------------------------------------------
+| Product Item Helpers
+|--------------------------------------------------------------------------
+*/
 
 function getRawItems(body = {}) {
-  if (Array.isArray(body.items)) return body.items;
-  if (Array.isArray(body.invoice_items)) return body.invoice_items;
-  if (Array.isArray(body.sales_invoice_items)) return body.sales_invoice_items;
-  if (Array.isArray(body.purchase_invoice_items)) return body.purchase_invoice_items;
+  if (Array.isArray(body.items)) {
+    return body.items;
+  }
+
+  if (Array.isArray(body.invoice_items)) {
+    return body.invoice_items;
+  }
+
+  if (Array.isArray(body.sales_invoice_items)) {
+    return body.sales_invoice_items;
+  }
+
+  if (Array.isArray(body.purchase_invoice_items)) {
+    return body.purchase_invoice_items;
+  }
+
   return [];
 }
 
-function normalizeRawItem(item = {}, index = 0) {
+function normalizeItem(item = {}, index = 0) {
   const quantity = toNumber(
     firstDefined(
       item.qty,
@@ -115,410 +424,95 @@ function normalizeRawItem(item = {}, index = 0) {
       item.carton_qty
     )
   );
+
   const rate = toNumber(item.rate);
+
   const amount = toNumber(
-    firstDefined(item.amount, item.line_total),
+    firstDefined(
+      item.amount,
+      item.line_total
+    ),
     quantity * rate
   );
 
   return {
     sr: toNumber(item.sr, index + 1),
+
     product_id: toPositiveId(item.product_id),
+
     product_name: cleanText(
       item.product_name ||
         item.item_name ||
         item.product_description ||
         item.description
     ),
-    product_description: cleanText(
-      item.product_description || item.description || item.product_name
+
+    category_name: cleanText(
+      item.category_name
     ),
-    category_id: toPositiveId(item.category_id),
-    category_name: cleanText(item.category_name),
-    unit_id: toPositiveId(item.unit_id),
-    unit_name: cleanText(item.unit_name),
-    product_type_id: toPositiveId(item.product_type_id),
+
+    unit_name: cleanText(
+      item.unit_name
+    ),
+
     type_name: cleanText(
-      item.type_name || item.product_type || item.product_type_name
-    ),
-    sale_type: cleanText(item.sale_type || "single") || "single",
-    carton_qty: toNumber(item.carton_qty),
-    pieces_qty: toNumber(item.pieces_qty, quantity),
-    qty: quantity,
-    quantity,
-    pieces_per_carton: toNumber(item.pieces_per_carton),
-    rate,
-    amount,
-    debit: toNumber(item.debit),
-    credit: toNumber(item.credit),
-  };
-}
-
-async function getRowById(connection, table, id) {
-  if (!id) return null;
-  const rows = await runQuery(
-    connection,
-    `SELECT * FROM \`${table}\` WHERE id = ? LIMIT 1`,
-    [id]
-  );
-  return rows[0] || null;
-}
-
-function pickName(row, keys) {
-  if (!row) return "";
-  for (const key of keys) {
-    const value = cleanText(row[key]);
-    if (value) return value;
-  }
-  return "";
-}
-
-async function getOrCreateProduct(connection, item) {
-  let product = null;
-
-  if (item.product_id) {
-    product = await getRowById(connection, "products", item.product_id);
-  }
-
-  if (!product && item.product_name) {
-    const rows = await runQuery(
-      connection,
-      "SELECT * FROM products WHERE LOWER(TRIM(product_name)) = LOWER(TRIM(?)) LIMIT 1",
-      [item.product_name]
-    );
-    product = rows[0] || null;
-  }
-
-  if (!product && item.product_name) {
-    const result = await runQuery(
-      connection,
-      "INSERT INTO products (product_name) VALUES (?)",
-      [item.product_name]
-    );
-    product = {
-      id: result.insertId,
-      product_name: item.product_name,
-    };
-  }
-
-  return product;
-}
-
-async function enrichItem(connection, rawItem, index) {
-  const item = normalizeRawItem(rawItem, index);
-  const product = await getOrCreateProduct(connection, item);
-
-  const category =
-    item.category_id || product?.category_id
-      ? await getRowById(
-          connection,
-          "categories",
-          item.category_id || product?.category_id
-        ).catch(() => null)
-      : null;
-
-  const unit =
-    item.unit_id || product?.unit_id
-      ? await getRowById(
-          connection,
-          "units",
-          item.unit_id || product?.unit_id
-        ).catch(() => null)
-      : null;
-
-  const productType =
-    item.product_type_id || product?.product_type_id
-      ? await getRowById(
-          connection,
-          "product_types",
-          item.product_type_id || product?.product_type_id
-        ).catch(() => null)
-      : null;
-
-  return {
-    ...item,
-    product_id: product?.id || item.product_id,
-    product_name:
-      item.product_name ||
-      pickName(product, ["product_name", "name", "name_en"]),
-    product_description:
-      item.product_description ||
-      pickName(product, ["product_description", "description"]),
-    category_id: item.category_id || product?.category_id || null,
-    category_name:
-      item.category_name ||
-      pickName(category, ["category_name", "name", "name_en"]),
-    unit_id: item.unit_id || product?.unit_id || null,
-    unit_name:
-      item.unit_name ||
-      pickName(unit, ["unit_name", "name", "name_en", "symbol"]),
-    product_type_id:
-      item.product_type_id || product?.product_type_id || null,
-    type_name:
       item.type_name ||
-      pickName(productType, [
-        "product_type_en",
-        "product_type",
-        "type_name",
-        "name",
-        "name_en",
-      ]),
+        item.product_type ||
+        item.product_type_name
+    ),
+
+    quantity,
+
+    rate,
+
+    amount: Number(
+      (
+        amount || quantity * rate
+      ).toFixed(2)
+    ),
   };
 }
 
-async function prepareItems(connection, body) {
+async function prepareInvoiceItems(body) {
   const rawItems = getRawItems(body);
-  const items = [];
 
-  for (let index = 0; index < rawItems.length; index += 1) {
-    const item = await enrichItem(connection, rawItems[index], index);
-
-    if (!item.product_id && !item.product_name) continue;
-    if (item.quantity <= 0) continue;
-
-    items.push({
-      ...item,
-      amount: Number((item.quantity * item.rate).toFixed(2)),
-    });
-  }
-
-  return items;
-}
-
-async function resolveSupplier(connection, body = {}) {
-  let supplierId = toPositiveId(
-    body.supplier_id ||
-      (cleanText(body.party_type || body.customer_type).toLowerCase() ===
-      "supplier"
-        ? body.party_id
-        : null)
-  );
-
-  let name = cleanText(
-    body.supplier_name ||
-      body.party_name ||
-      body.customer_name_en ||
-      body.customer_name ||
-      body.name
-  );
-
-  if (supplierId && !name) {
-    const supplier = await getRowById(
-      connection,
-      "suppliers",
-      supplierId
-    ).catch(() => null);
-    name = pickName(supplier, ["supplier_name", "name", "name_en"]);
-  }
-
-  if (!supplierId && name) {
-    const rows = await runQuery(
-      connection,
-      "SELECT id, supplier_name FROM suppliers WHERE LOWER(TRIM(supplier_name)) = LOWER(TRIM(?)) LIMIT 1",
-      [name]
-    ).catch(() => []);
-
-    if (rows[0]) {
-      supplierId = rows[0].id;
-      name = rows[0].supplier_name || name;
-    }
-  }
-
-  return { supplierId, supplierName: name };
-}
-
-function buildHeader(body, items, supplier) {
-  const calculatedTotal = items.reduce(
-    (sum, item) => sum + toNumber(item.amount),
-    0
-  );
-
-  const invoiceTotal = toNumber(
-    firstDefined(body.invoice_total, body.total_amount),
-    calculatedTotal
-  );
-
-  const previousBalance = toNumber(body.previous_balance);
-  const deliveryCharges = toNumber(
-    firstDefined(body.delivery_charges, body.deliveryCharges)
-  );
-  const discount = toNumber(body.discount);
-
-  const grandTotal = toNumber(
-    body.grand_total,
-    invoiceTotal + previousBalance + deliveryCharges - discount
-  );
-
-  const paidAmount = toNumber(
-    firstDefined(
-      body.credit,
-      body.paid_amount,
-      body.payment_received,
-      body.advance_receive
+  return rawItems
+    .map(normalizeItem)
+    .filter(
+      (item) =>
+        (item.product_id || item.product_name) &&
+        item.quantity > 0
     )
-  );
-
-  return {
-    invoice_no: cleanText(body.invoice_no),
-    supplier_id: supplier.supplierId,
-    supplier_name: supplier.supplierName,
-    invoice_date: toDate(body.invoice_date),
-    total_amount: Number(grandTotal.toFixed(2)),
-    debit: toNumber(body.debit, Number(grandTotal.toFixed(2))),
-    credit: Number(paidAmount.toFixed(2)),
-    status: cleanText(body.status || body.payment_status || "pending") || "pending",
-    reference_no: cleanText(body.reference_no),
-    previous_balance: previousBalance,
-    delivery_charges: deliveryCharges,
-    discount,
-    invoice_total: invoiceTotal,
-    grand_total: grandTotal,
-  };
+    .map((item) => ({
+      ...item,
+      amount: Number(
+        (
+          item.quantity * item.rate
+        ).toFixed(2)
+      ),
+    }));
 }
 
-async function getInvoiceItems(connection, invoiceId) {
-  const rows = await runQuery(
-    connection,
-    `
-      SELECT
-        pii.id,
-        pii.invoice_id,
-        pii.product_id,
-        COALESCE(p.product_name, '') AS product_name,
-        pii.unit_name,
-        pii.category_name,
-        pii.type_name,
-        pii.quantity,
-        pii.rate,
-        pii.amount,
-        p.category_id,
-        p.unit_id,
-        p.product_type_id
-      FROM purchase_invoice_items pii
-      LEFT JOIN products p ON p.id = pii.product_id
-      WHERE pii.invoice_id = ?
-      ORDER BY pii.id ASC
-    `,
-    [invoiceId]
-  );
-
-  return rows.map((row, index) => {
-    const quantity = toNumber(row.quantity);
-    const rate = toNumber(row.rate);
-    const amount = toNumber(row.amount, quantity * rate);
-
-    return {
-      id: row.id,
-      invoice_id: row.invoice_id,
-      sr: index + 1,
-      product_id: row.product_id,
-      product_name: row.product_name || "",
-      product_description: row.product_name || "",
-      description: row.product_name || "",
-      category_id: row.category_id || null,
-      category_name: row.category_name || "",
-      unit_id: row.unit_id || null,
-      unit_name: row.unit_name || "",
-      product_type_id: row.product_type_id || null,
-      type_name: row.type_name || "",
-      product_type: row.type_name || "",
-      sale_type: "single",
-      carton_qty: 0,
-      pieces_qty: quantity,
-      qty: quantity,
-      quantity,
-      pieces_per_carton: 0,
-      rate,
-      amount,
-      debit: 0,
-      credit: 0,
-    };
-  });
-}
-
-async function resolveSupplierIdByName(connection, name) {
-  if (!name) return null;
-
-  const rows = await runQuery(
-    connection,
-    "SELECT id FROM suppliers WHERE LOWER(TRIM(supplier_name)) = LOWER(TRIM(?)) LIMIT 1",
-    [name]
-  ).catch(() => []);
-
-  return rows[0]?.id || null;
-}
-
-async function normalizeInvoiceResponse(connection, row) {
-  const items = await getInvoiceItems(connection, row.id);
-  const supplierName = cleanText(row.supplier_name);
-  const supplierId = await resolveSupplierIdByName(
-    connection,
-    supplierName
-  );
-  const total = toNumber(row.total_amount);
-  const debit = toNumber(row.debit, total);
-  const credit = toNumber(row.credit);
-  const totalQty = items.reduce((sum, item) => sum + toNumber(item.qty), 0);
-
-  return {
-    id: row.id,
-    invoice_no: row.invoice_no || "",
-    reference_no: "",
-    party_type: "supplier",
-    party_id: supplierId || "",
-    party_name: supplierName,
-    customer_type: "supplier",
-    customer_name: supplierName,
-    customer_name_en: supplierName,
-    supplier_id: supplierId || "",
-    supplier_name: supplierName,
-    invoice_date: toDate(row.invoice_date),
-    address: "",
-    previous_balance: 0,
-    delivery_charges: 0,
-    discount: 0,
-    invoice_total: total,
-    total_amount: total,
-    grand_total: total,
-    total_qty: totalQty,
-    items_count: items.length,
-    debit,
-    credit,
-    paid_amount: credit,
-    remaining_balance: Math.max(debit - credit, 0),
-    payment_status: row.status || "pending",
-    status: row.status || "pending",
-    items,
-  };
-}
-
-async function getInvoiceById(connection, id) {
-  const rows = await runQuery(
-    connection,
-    "SELECT * FROM purchase_invoices WHERE id = ? LIMIT 1",
-    [id]
-  );
-
-  if (!rows[0]) return null;
-  return normalizeInvoiceResponse(connection, rows[0]);
-}
-
-async function insertItems(connection, invoiceId, items) {
+async function insertInvoiceItems(
+  connection,
+  invoiceId,
+  items
+) {
   for (const item of items) {
-    await runQuery(
+    await query(
       connection,
       `
         INSERT INTO purchase_invoice_items
-          (
-            invoice_id,
-            product_id,
-            unit_name,
-            category_name,
-            type_name,
-            quantity,
-            rate,
-            amount
-          )
+        (
+          invoice_id,
+          product_id,
+          unit_name,
+          category_name,
+          type_name,
+          quantity,
+          rate,
+          amount
+        )
         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
       `,
       [
@@ -535,348 +529,1055 @@ async function insertItems(connection, invoiceId, items) {
   }
 }
 
-async function validateInvoiceRequest(connection, body) {
-  const items = await prepareItems(connection, body);
-  const supplier = await resolveSupplier(connection, body);
-  const header = buildHeader(body, items, supplier);
+async function getInvoiceItems(
+  connection,
+  invoiceId
+) {
+  const rows = await query(
+    connection,
+    `
+      SELECT
+        pii.id,
+        pii.invoice_id,
+        pii.product_id,
 
-  if (!header.invoice_no) {
-    const error = new Error("Invoice No zaroori hai.");
-    error.status = 400;
-    throw error;
+        COALESCE(
+          NULLIF(p.product_name, ''),
+          ''
+        ) AS product_name,
+
+        pii.unit_name,
+        pii.category_name,
+        pii.type_name,
+        pii.quantity,
+        pii.rate,
+        pii.amount
+
+      FROM purchase_invoice_items pii
+
+      LEFT JOIN products p
+        ON p.id = pii.product_id
+
+      WHERE pii.invoice_id = ?
+
+      ORDER BY pii.id ASC
+    `,
+    [invoiceId]
+  );
+
+  return rows.map((row, index) => {
+    const quantity = toNumber(row.quantity);
+    const rate = toNumber(row.rate);
+    const amount = toNumber(
+      row.amount,
+      quantity * rate
+    );
+
+    return {
+      id: row.id,
+      invoice_id: row.invoice_id,
+      sr: index + 1,
+
+      product_id: row.product_id,
+      product_name:
+        row.product_name ||
+        `Product #${row.product_id || ""}`,
+
+      product_description:
+        row.product_name || "",
+
+      description:
+        row.product_name || "",
+
+      category_name:
+        row.category_name || "",
+
+      unit_name:
+        row.unit_name || "",
+
+      type_name:
+        row.type_name || "",
+
+      product_type:
+        row.type_name || "",
+
+      sale_type: "single",
+
+      carton_qty: 0,
+      pieces_qty: quantity,
+      qty: quantity,
+      quantity,
+      pieces_per_carton: 0,
+
+      rate,
+      amount,
+
+      debit: 0,
+      credit: 0,
+    };
+  });
+}
+
+/*
+|--------------------------------------------------------------------------
+| Invoice Response Helpers
+|--------------------------------------------------------------------------
+*/
+
+async function findSupplierIdByName(
+  connection,
+  supplierName
+) {
+  if (!supplierName) return null;
+
+  const rows = await query(
+    connection,
+    `
+      SELECT id
+      FROM suppliers
+      WHERE LOWER(TRIM(supplier_name)) =
+            LOWER(TRIM(?))
+      LIMIT 1
+    `,
+    [supplierName]
+  ).catch(() => []);
+
+  return rows[0]?.id || null;
+}
+
+async function normalizeInvoiceResponse(
+  connection,
+  invoice
+) {
+  const items = await getInvoiceItems(
+    connection,
+    invoice.id
+  );
+
+  const supplierName = cleanText(
+    invoice.supplier_name
+  );
+
+  const supplierId =
+    await findSupplierIdByName(
+      connection,
+      supplierName
+    );
+
+  const totalAmount = toNumber(
+    invoice.total_amount
+  );
+
+  const debit = toNumber(
+    invoice.debit,
+    totalAmount
+  );
+
+  const credit = toNumber(
+    invoice.credit
+  );
+
+  const totalQuantity = items.reduce(
+    (total, item) =>
+      total + toNumber(item.quantity),
+    0
+  );
+
+  return {
+    id: invoice.id,
+
+    invoice_no:
+      invoice.invoice_no || "",
+
+    reference_no: "",
+
+    party_type: "supplier",
+    customer_type: "supplier",
+
+    party_id: supplierId || "",
+    supplier_id: supplierId || "",
+
+    party_name: supplierName,
+    supplier_name: supplierName,
+
+    customer_name: supplierName,
+    customer_name_en: supplierName,
+
+    invoice_date: toDate(
+      invoice.invoice_date
+    ),
+
+    address: "",
+
+    previous_balance: 0,
+    delivery_charges: 0,
+    discount: 0,
+
+    invoice_total: totalAmount,
+    total_amount: totalAmount,
+    grand_total: totalAmount,
+
+    total_qty: totalQuantity,
+    items_count: items.length,
+
+    debit,
+    credit,
+
+    paid_amount: credit,
+
+    remaining_balance: Math.max(
+      debit - credit,
+      0
+    ),
+
+    payment_status:
+      invoice.status || "pending",
+
+    status:
+      invoice.status || "pending",
+
+    items,
+  };
+}
+
+async function getInvoiceById(
+  connection,
+  invoiceId
+) {
+  const rows = await query(
+    connection,
+    `
+      SELECT *
+      FROM purchase_invoices
+      WHERE id = ?
+      LIMIT 1
+    `,
+    [invoiceId]
+  );
+
+  if (!rows[0]) return null;
+
+  return normalizeInvoiceResponse(
+    connection,
+    rows[0]
+  );
+}
+
+/*
+|--------------------------------------------------------------------------
+| Request Validation
+|--------------------------------------------------------------------------
+*/
+
+async function prepareInvoiceRequest(
+  connection,
+  body
+) {
+  const supplier = await resolveSupplier(
+    connection,
+    body
+  );
+
+  const items = await prepareInvoiceItems(body);
+
+  let invoiceNo =
+    normalizePurchaseInvoiceNo(
+      body.invoice_no
+    );
+
+  if (!invoiceNo) {
+    invoiceNo = await getUniqueInvoiceNumber(
+      connection,
+      "purchase-invoice01"
+    );
   }
 
-  if (!header.supplier_name) {
-    const error = new Error("Supplier zaroori hai.");
+  if (!supplier.supplierName) {
+    const error = new Error(
+      "Supplier select karein."
+    );
+
     error.status = 400;
     throw error;
   }
 
   if (!items.length) {
-    const error = new Error("Kam az kam aik valid product zaroori hai.");
+    const error = new Error(
+      "Kam az kam aik valid product aur quantity add karein."
+    );
+
     error.status = 400;
     throw error;
   }
 
-  return { header, items };
+  const calculatedTotal = items.reduce(
+    (total, item) =>
+      total + toNumber(item.amount),
+    0
+  );
+
+  const totalAmount = toNumber(
+    firstDefined(
+      body.grand_total,
+      body.invoice_total,
+      body.total_amount
+    ),
+    calculatedTotal
+  );
+
+  const debit = toNumber(
+    body.debit,
+    totalAmount
+  );
+
+  const credit = toNumber(
+    firstDefined(
+      body.credit,
+      body.paid_amount,
+      body.payment_received
+    )
+  );
+
+  return {
+    invoiceNo,
+
+    supplierId:
+      supplier.supplierId,
+
+    supplierName:
+      supplier.supplierName,
+
+    invoiceDate:
+      toDate(body.invoice_date),
+
+    totalAmount:
+      Number(totalAmount.toFixed(2)),
+
+    debit:
+      Number(debit.toFixed(2)),
+
+    credit:
+      Number(credit.toFixed(2)),
+
+    status:
+      cleanText(
+        body.status ||
+          body.payment_status ||
+          "pending"
+      ) || "pending",
+
+    items,
+  };
 }
 
-// GET /api/purchase-invoices
-router.get("/", async (req, res) => {
-  const { connection, release } = await getConnection();
+/*
+|--------------------------------------------------------------------------
+| GET NEXT INVOICE NUMBER
+|--------------------------------------------------------------------------
+| Important: this route must remain before /:id.
+*/
+
+router.get("/next-number", async (req, res) => {
+  const { connection, release } =
+    await getConnection();
 
   try {
-    const rows = await runQuery(
-      connection,
-      "SELECT * FROM purchase_invoices ORDER BY id DESC"
+    const invoiceNo =
+      await getUniqueInvoiceNumber(
+        connection,
+        "purchase-invoice01"
+      );
+
+    res.json({
+      success: true,
+      invoice_no: invoiceNo,
+      data: {
+        invoice_no: invoiceNo,
+      },
+    });
+  } catch (error) {
+    console.error(
+      "GET /purchase-invoices/next-number:",
+      error
     );
 
-    const data = [];
-    for (const row of rows) {
-      data.push(await normalizeInvoiceResponse(connection, row));
-    }
-
-    // Array response keeps the old Purchase page compatible.
-    res.json(data);
-  } catch (error) {
-    console.error("GET /purchase-invoices:", error);
     res.status(500).json({
       success: false,
-      message: error.message || "Purchase invoices load nahi ho sakin.",
+      message:
+        error.message ||
+        "Next invoice number generate nahi hua.",
     });
   } finally {
     release();
   }
 });
 
-// Sales-style supplier invoice filter
-router.get("/customer/:partyType/:partyId", async (req, res) => {
-  const { connection, release } = await getConnection();
+/*
+|--------------------------------------------------------------------------
+| GET SUPPLIER INVOICES
+|--------------------------------------------------------------------------
+| Sales Invoice page compatibility.
+*/
+
+router.get(
+  "/customer/:partyType/:partyId",
+  async (req, res) => {
+    const { connection, release } =
+      await getConnection();
+
+    try {
+      const partyType = cleanText(
+        req.params.partyType
+      ).toLowerCase();
+
+      const supplierId = toPositiveId(
+        req.params.partyId
+      );
+
+      if (
+        partyType !== "supplier" ||
+        !supplierId
+      ) {
+        return res.json({
+          success: true,
+          data: [],
+          invoices: [],
+        });
+      }
+
+      const supplier = await getSupplierById(
+        connection,
+        supplierId
+      );
+
+      if (!supplier) {
+        return res.json({
+          success: true,
+          data: [],
+          invoices: [],
+        });
+      }
+
+      const supplierName =
+        getSupplierName(supplier);
+
+      const rows = await query(
+        connection,
+        `
+          SELECT *
+          FROM purchase_invoices
+          WHERE LOWER(TRIM(supplier_name)) =
+                LOWER(TRIM(?))
+          ORDER BY id DESC
+        `,
+        [supplierName]
+      );
+
+      const invoices = [];
+
+      for (const row of rows) {
+        invoices.push(
+          await normalizeInvoiceResponse(
+            connection,
+            row
+          )
+        );
+      }
+
+      res.json({
+        success: true,
+        data: invoices,
+        invoices,
+      });
+    } catch (error) {
+      console.error(
+        "GET supplier purchase invoices:",
+        error
+      );
+
+      res.status(500).json({
+        success: false,
+        message:
+          error.message ||
+          "Supplier invoices load nahi huin.",
+      });
+    } finally {
+      release();
+    }
+  }
+);
+
+/*
+|--------------------------------------------------------------------------
+| BULK PRINT DATA
+|--------------------------------------------------------------------------
+*/
+
+router.post(
+  "/bulk-print-data",
+  async (req, res) => {
+    const { connection, release } =
+      await getConnection();
+
+    try {
+      const ids = Array.isArray(req.body?.ids)
+        ? req.body.ids
+            .map(toPositiveId)
+            .filter(Boolean)
+        : [];
+
+      if (!ids.length) {
+        return res.status(400).json({
+          success: false,
+          message:
+            "Invoice IDs zaroori hain.",
+        });
+      }
+
+      const rows = await query(
+        connection,
+        `
+          SELECT *
+          FROM purchase_invoices
+          WHERE id IN (?)
+          ORDER BY id DESC
+        `,
+        [ids]
+      );
+
+      const invoices = [];
+
+      for (const row of rows) {
+        invoices.push(
+          await normalizeInvoiceResponse(
+            connection,
+            row
+          )
+        );
+      }
+
+      res.json({
+        success: true,
+        data: invoices,
+        invoices,
+      });
+    } catch (error) {
+      console.error(
+        "POST purchase invoice bulk print:",
+        error
+      );
+
+      res.status(500).json({
+        success: false,
+        message:
+          error.message ||
+          "Bulk print data load nahi hua.",
+      });
+    } finally {
+      release();
+    }
+  }
+);
+
+/*
+|--------------------------------------------------------------------------
+| GET ALL PURCHASE INVOICES
+|--------------------------------------------------------------------------
+*/
+
+router.get("/", async (req, res) => {
+  const { connection, release } =
+    await getConnection();
 
   try {
-    if (cleanText(req.params.partyType).toLowerCase() !== "supplier") {
-      return res.json({ success: true, data: [], invoices: [] });
-    }
-
-    const supplier = await getRowById(
-      connection,
-      "suppliers",
-      toPositiveId(req.params.partyId)
-    );
-
-    if (!supplier) {
-      return res.json({ success: true, data: [], invoices: [] });
-    }
-
-    const name = pickName(supplier, ["supplier_name"]);
-    const rows = await runQuery(
+    const rows = await query(
       connection,
       `
         SELECT *
         FROM purchase_invoices
-        WHERE LOWER(TRIM(supplier_name)) = LOWER(TRIM(?))
         ORDER BY id DESC
-      `,
-      [name]
+      `
     );
 
-    const data = [];
+    const invoices = [];
+
     for (const row of rows) {
-      data.push(await normalizeInvoiceResponse(connection, row));
+      invoices.push(
+        await normalizeInvoiceResponse(
+          connection,
+          row
+        )
+      );
     }
 
-    res.json({ success: true, data, invoices: data });
+    /*
+     * Array response old Purchase Invoice frontend
+     * aur new wrapper dono ke saath compatible hai.
+     */
+    res.json(invoices);
   } catch (error) {
-    console.error("GET /purchase-invoices/customer:", error);
+    console.error(
+      "GET /purchase-invoices:",
+      error
+    );
+
     res.status(500).json({
       success: false,
-      message: error.message || "Supplier invoices load nahi ho sakin.",
+      message:
+        error.message ||
+        "Purchase invoices load nahi huin.",
     });
   } finally {
     release();
   }
 });
 
-// Sales-style bulk print
-router.post("/bulk-print-data", async (req, res) => {
-  const { connection, release } = await getConnection();
+/*
+|--------------------------------------------------------------------------
+| GET SINGLE PURCHASE INVOICE
+|--------------------------------------------------------------------------
+*/
+
+router.get("/:id", async (req, res) => {
+  const { connection, release } =
+    await getConnection();
 
   try {
-    const ids = Array.isArray(req.body?.ids)
-      ? req.body.ids.map(toPositiveId).filter(Boolean)
-      : [];
+    const invoiceId = toPositiveId(
+      req.params.id
+    );
 
-    if (!ids.length) {
+    if (!invoiceId) {
       return res.status(400).json({
         success: false,
-        message: "Invoice ids zaroori hain.",
+        message:
+          "Valid invoice ID zaroori hai.",
       });
     }
 
-    const rows = await runQuery(
-      connection,
-      "SELECT * FROM purchase_invoices WHERE id IN (?) ORDER BY id DESC",
-      [ids]
-    );
-
-    const data = [];
-    for (const row of rows) {
-      data.push(await normalizeInvoiceResponse(connection, row));
-    }
-
-    res.json({ success: true, data, invoices: data });
-  } catch (error) {
-    console.error("POST /purchase-invoices/bulk-print-data:", error);
-    res.status(500).json({
-      success: false,
-      message: error.message || "Bulk print data load nahi hua.",
-    });
-  } finally {
-    release();
-  }
-});
-
-// GET /api/purchase-invoices/:id
-router.get("/:id", async (req, res) => {
-  const { connection, release } = await getConnection();
-
-  try {
     const invoice = await getInvoiceById(
       connection,
-      toPositiveId(req.params.id)
+      invoiceId
     );
 
     if (!invoice) {
       return res.status(404).json({
         success: false,
-        message: "Purchase invoice nahi mili.",
+        message:
+          "Purchase invoice nahi mili.",
       });
     }
 
-    res.json({ success: true, data: invoice, invoice });
+    res.json({
+      success: true,
+      data: invoice,
+      invoice,
+    });
   } catch (error) {
-    console.error(`GET /purchase-invoices/${req.params.id}:`, error);
+    console.error(
+      `GET /purchase-invoices/${req.params.id}:`,
+      error
+    );
+
     res.status(500).json({
       success: false,
-      message: error.message || "Purchase invoice load nahi hui.",
+      message:
+        error.message ||
+        "Purchase invoice load nahi hui.",
     });
   } finally {
     release();
   }
 });
 
-// POST /api/purchase-invoices
+/*
+|--------------------------------------------------------------------------
+| CREATE PURCHASE INVOICE
+|--------------------------------------------------------------------------
+*/
+
 router.post("/", async (req, res) => {
   try {
-    const invoice = await withTransaction(async (connection) => {
-      const { header, items } = await validateInvoiceRequest(
-        connection,
-        req.body
-      );
+    const invoice = await withTransaction(
+      async (connection) => {
+        const prepared =
+          await prepareInvoiceRequest(
+            connection,
+            req.body
+          );
 
-      const result = await runQuery(
-        connection,
-        `
-          INSERT INTO purchase_invoices
-            (
-              invoice_no,
-              supplier_name,
-              invoice_date,
-              total_amount,
-              debit,
-              credit,
-              status
-            )
-          VALUES (?, ?, ?, ?, ?, ?, ?)
-        `,
-        [
-          header.invoice_no,
-          header.supplier_name,
-          header.invoice_date,
-          header.total_amount,
-          header.debit,
-          header.credit,
-          header.status,
-        ]
-      );
+        let requestedInvoiceNo =
+          prepared.invoiceNo;
 
-      await insertItems(connection, result.insertId, items);
-      return getInvoiceById(connection, result.insertId);
-    });
+        let insertResult = null;
+        let finalInvoiceNo = null;
 
-    res.json({
+        /*
+         * Retry protection:
+         * Do users same number bhej dein tab bhi
+         * next number automatically generate hoga.
+         */
+        for (
+          let attempt = 0;
+          attempt < 10;
+          attempt += 1
+        ) {
+          finalInvoiceNo =
+            await getUniqueInvoiceNumber(
+              connection,
+              requestedInvoiceNo
+            );
+
+          try {
+            insertResult = await query(
+              connection,
+              `
+                INSERT INTO purchase_invoices
+                (
+                  invoice_no,
+                  supplier_name,
+                  invoice_date,
+                  total_amount,
+                  debit,
+                  credit,
+                  status
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+              `,
+              [
+                finalInvoiceNo,
+                prepared.supplierName,
+                prepared.invoiceDate,
+                prepared.totalAmount,
+                prepared.debit,
+                prepared.credit,
+                prepared.status,
+              ]
+            );
+
+            break;
+          } catch (error) {
+            const duplicateInvoiceNumber =
+              error?.code === "ER_DUP_ENTRY" &&
+              /invoice_no/i.test(
+                `${
+                  error.message || ""
+                } ${
+                  error.sqlMessage || ""
+                }`
+              );
+
+            if (!duplicateInvoiceNumber) {
+              throw error;
+            }
+
+            requestedInvoiceNo =
+              finalInvoiceNo;
+          }
+        }
+
+        if (!insertResult?.insertId) {
+          const error = new Error(
+            "Unique invoice number generate nahi ho saka. Dobara try karein."
+          );
+
+          error.status = 409;
+          throw error;
+        }
+
+        await insertInvoiceItems(
+          connection,
+          insertResult.insertId,
+          prepared.items
+        );
+
+        return getInvoiceById(
+          connection,
+          insertResult.insertId
+        );
+      }
+    );
+
+    res.status(201).json({
       success: true,
-      message: "Purchase invoice save ho gayi!",
+      message:
+        "Purchase invoice save ho gayi!",
       data: invoice,
       invoice,
     });
   } catch (error) {
-    console.error("POST /purchase-invoices:", error);
-    res.status(error.status || 500).json({
-      success: false,
-      message: error.message || "Purchase invoice save nahi hui.",
-    });
+    console.error(
+      "POST /purchase-invoices:",
+      error
+    );
+
+    const duplicateInvoiceNumber =
+      error?.code === "ER_DUP_ENTRY" &&
+      /invoice_no/i.test(
+        `${
+          error.message || ""
+        } ${
+          error.sqlMessage || ""
+        }`
+      );
+
+    res
+      .status(
+        error.status ||
+          (duplicateInvoiceNumber
+            ? 409
+            : 500)
+      )
+      .json({
+        success: false,
+
+        message: duplicateInvoiceNumber
+          ? "Invoice number pehle se maujood hai. Dobara Save karein; next number automatically generate hoga."
+          : error.message ||
+            "Purchase invoice save nahi hui.",
+      });
   }
 });
 
-// PUT /api/purchase-invoices/:id
+/*
+|--------------------------------------------------------------------------
+| UPDATE PURCHASE INVOICE
+|--------------------------------------------------------------------------
+*/
+
 router.put("/:id", async (req, res) => {
   try {
-    const invoice = await withTransaction(async (connection) => {
-      const invoiceId = toPositiveId(req.params.id);
-      const existing = await getInvoiceById(connection, invoiceId);
+    const invoice = await withTransaction(
+      async (connection) => {
+        const invoiceId = toPositiveId(
+          req.params.id
+        );
 
-      if (!existing) {
-        const error = new Error("Purchase invoice nahi mili.");
-        error.status = 404;
-        throw error;
-      }
+        if (!invoiceId) {
+          const error = new Error(
+            "Valid invoice ID zaroori hai."
+          );
 
-      const { header, items } = await validateInvoiceRequest(
-        connection,
-        req.body
-      );
+          error.status = 400;
+          throw error;
+        }
 
-      await runQuery(
-        connection,
-        `
-          UPDATE purchase_invoices
-          SET
-            invoice_no = ?,
-            supplier_name = ?,
-            invoice_date = ?,
-            total_amount = ?,
-            debit = ?,
-            credit = ?,
-            status = ?
-          WHERE id = ?
-        `,
-        [
-          header.invoice_no,
-          header.supplier_name,
-          header.invoice_date,
-          header.total_amount,
-          header.debit,
-          header.credit,
-          header.status,
+        const existingInvoice =
+          await getInvoiceById(
+            connection,
+            invoiceId
+          );
+
+        if (!existingInvoice) {
+          const error = new Error(
+            "Purchase invoice nahi mili."
+          );
+
+          error.status = 404;
+          throw error;
+        }
+
+        const prepared =
+          await prepareInvoiceRequest(
+            connection,
+            req.body
+          );
+
+        const duplicateExists =
+          await invoiceNumberExists(
+            connection,
+            prepared.invoiceNo,
+            invoiceId
+          );
+
+        if (duplicateExists) {
+          const error = new Error(
+            `Invoice No "${prepared.invoiceNo}" pehle se maujood hai.`
+          );
+
+          error.status = 409;
+          throw error;
+        }
+
+        await query(
+          connection,
+          `
+            UPDATE purchase_invoices
+            SET
+              invoice_no = ?,
+              supplier_name = ?,
+              invoice_date = ?,
+              total_amount = ?,
+              debit = ?,
+              credit = ?,
+              status = ?
+            WHERE id = ?
+          `,
+          [
+            prepared.invoiceNo,
+            prepared.supplierName,
+            prepared.invoiceDate,
+            prepared.totalAmount,
+            prepared.debit,
+            prepared.credit,
+            prepared.status,
+            invoiceId,
+          ]
+        );
+
+        await query(
+          connection,
+          `
+            DELETE FROM purchase_invoice_items
+            WHERE invoice_id = ?
+          `,
+          [invoiceId]
+        );
+
+        await insertInvoiceItems(
+          connection,
           invoiceId,
-        ]
-      );
+          prepared.items
+        );
 
-      await runQuery(
-        connection,
-        "DELETE FROM purchase_invoice_items WHERE invoice_id = ?",
-        [invoiceId]
-      );
-      await insertItems(connection, invoiceId, items);
-
-      return getInvoiceById(connection, invoiceId);
-    });
+        return getInvoiceById(
+          connection,
+          invoiceId
+        );
+      }
+    );
 
     res.json({
       success: true,
-      message: "Purchase invoice update ho gayi!",
+      message:
+        "Purchase invoice update ho gayi!",
       data: invoice,
       invoice,
     });
   } catch (error) {
-    console.error(`PUT /purchase-invoices/${req.params.id}:`, error);
-    res.status(error.status || 500).json({
-      success: false,
-      message: error.message || "Purchase invoice update nahi hui.",
-    });
+    console.error(
+      `PUT /purchase-invoices/${req.params.id}:`,
+      error
+    );
+
+    res
+      .status(error.status || 500)
+      .json({
+        success: false,
+        message:
+          error.message ||
+          "Purchase invoice update nahi hui.",
+      });
   }
 });
 
-// DELETE /api/purchase-invoices/:id
+/*
+|--------------------------------------------------------------------------
+| DELETE PURCHASE INVOICE
+|--------------------------------------------------------------------------
+*/
+
 router.delete("/:id", async (req, res) => {
   try {
-    await withTransaction(async (connection) => {
-      const invoiceId = toPositiveId(req.params.id);
-      const existing = await getInvoiceById(connection, invoiceId);
-
-      if (!existing) {
-        const error = new Error("Purchase invoice nahi mili.");
-        error.status = 404;
-        throw error;
-      }
-
-      const returnRows = await runQuery(
-        connection,
-        "SELECT id FROM purchase_returns WHERE invoice_id = ? LIMIT 1",
-        [invoiceId]
-      ).catch(() => []);
-
-      if (returnRows.length) {
-        const error = new Error(
-          "Is invoice ke purchase returns maujood hain. Pehle returns delete karein."
+    await withTransaction(
+      async (connection) => {
+        const invoiceId = toPositiveId(
+          req.params.id
         );
-        error.status = 409;
-        throw error;
-      }
 
-      await runQuery(
-        connection,
-        "DELETE FROM purchase_invoice_items WHERE invoice_id = ?",
-        [invoiceId]
-      );
-      await runQuery(
-        connection,
-        "DELETE FROM purchase_invoices WHERE id = ?",
-        [invoiceId]
-      );
-    });
+        if (!invoiceId) {
+          const error = new Error(
+            "Valid invoice ID zaroori hai."
+          );
+
+          error.status = 400;
+          throw error;
+        }
+
+        const existingInvoice =
+          await getInvoiceById(
+            connection,
+            invoiceId
+          );
+
+        if (!existingInvoice) {
+          const error = new Error(
+            "Purchase invoice nahi mili."
+          );
+
+          error.status = 404;
+          throw error;
+        }
+
+        /*
+         * Check whether purchase_returns table exists.
+         */
+        const tableRows = await query(
+          connection,
+          "SHOW TABLES LIKE 'purchase_returns'"
+        );
+
+        if (tableRows.length) {
+          const returnRows = await query(
+            connection,
+            `
+              SELECT id
+              FROM purchase_returns
+              WHERE invoice_id = ?
+              LIMIT 1
+            `,
+            [invoiceId]
+          );
+
+          if (returnRows.length) {
+            const error = new Error(
+              "Is invoice ke purchase returns maujood hain. Pehle related returns delete karein."
+            );
+
+            error.status = 409;
+            throw error;
+          }
+        }
+
+        await query(
+          connection,
+          `
+            DELETE FROM purchase_invoice_items
+            WHERE invoice_id = ?
+          `,
+          [invoiceId]
+        );
+
+        await query(
+          connection,
+          `
+            DELETE FROM purchase_invoices
+            WHERE id = ?
+          `,
+          [invoiceId]
+        );
+      }
+    );
 
     res.json({
       success: true,
-      message: "Purchase invoice delete ho gayi!",
+      message:
+        "Purchase invoice delete ho gayi!",
     });
   } catch (error) {
-    console.error(`DELETE /purchase-invoices/${req.params.id}:`, error);
-    res.status(error.status || 500).json({
-      success: false,
-      message: error.message || "Purchase invoice delete nahi hui.",
-    });
+    console.error(
+      `DELETE /purchase-invoices/${req.params.id}:`,
+      error
+    );
+
+    res
+      .status(error.status || 500)
+      .json({
+        success: false,
+        message:
+          error.message ||
+          "Purchase invoice delete nahi hui.",
+      });
   }
 });
 
