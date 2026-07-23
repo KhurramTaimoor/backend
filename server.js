@@ -1,20 +1,18 @@
 const express = require("express");
 const cors = require("cors");
+
 const app = express();
 
 const allowedOrigins = [
   "https://app.alibirdcageofficial.store",
   "https://alibirdcageofficial.store",
   "https://www.alibirdcageofficial.store",
-
-  // Local frontend testing
   "http://localhost:5173",
   "http://127.0.0.1:5173",
 ];
 
 const corsOptions = {
-  origin: function (origin, callback) {
-    // Postman, mobile apps aur server-to-server requests allow
+  origin(origin, callback) {
     if (!origin) return callback(null, true);
 
     if (allowedOrigins.includes(origin)) {
@@ -23,27 +21,26 @@ const corsOptions = {
 
     return callback(new Error("Not allowed by CORS"));
   },
-
-  methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+  methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
   allowedHeaders: ["Content-Type", "Authorization"],
   credentials: true,
 };
 
 app.use(cors(corsOptions));
 app.options("*", cors(corsOptions));
-app.use(express.json());
+app.use(express.json({ limit: "10mb" }));
+app.use(express.urlencoded({ extended: true, limit: "10mb" }));
 
 app.get("/", (req, res) => {
   res.send("Backend is live");
 });
 
 app.get("/health", (req, res) => {
-  res.json({ ok: true });
+  res.json({
+    ok: true,
+    timestamp: new Date().toISOString(),
+  });
 });
-
-// ─────────────────────────────────────────────────────────────
-// ROUTES IMPORTS
-// ─────────────────────────────────────────────────────────────
 
 const productTypeRoutes = require("./routes/productType");
 const categoryRoutes = require("./routes/category");
@@ -53,12 +50,8 @@ const unitRoutes = require("./routes/unit");
 const openingStockRoutes = require("./routes/openingStock");
 const stockReceiveRoutes = require("./routes/stockReceive");
 const stockIssueRoutes = require("./routes/stockIssue");
-
-/* NEW ROUTES */
 const stockDemandRoutes = require("./routes/stockDemand");
-const productProfitLossReportRoutes = require(
-  "./routes/productProfitLossReport"
-);
+const productProfitLossReportRoutes = require("./routes/productProfitLossReport");
 
 const departmentRoutes = require("./routes/departments");
 const inventoryReportRoutes = require("./routes/inventoryReport");
@@ -99,22 +92,14 @@ const bomRoutes = require("./routes/bom");
 const assemblyRoutes = require("./routes/assembly");
 const productionInvoiceRoutes = require("./routes/productionInvoice");
 const productionReportRoutes = require("./routes/productionReport");
-const productionReturnInvoiceRoutes = require(
-  "./routes/productionReturnInvoice"
-);
+const productionReturnInvoiceRoutes = require("./routes/productionReturnInvoice");
 
 const permissionsRoutes = require("./routes/permissions");
-const LedgerRoutes = require("./routes/LedgerRoutes");
+const ledgerRoutes = require("./routes/LedgerRoutes");
 const authRoutes = require("./routes/authRoutes");
-
-/* ALL LEDGER SUMMARY */
 const allLedgerSummaryRoutes = require("./routes/allLedgerSummary");
 
-// ─────────────────────────────────────────────────────────────
-// ROUTES USE
-// ─────────────────────────────────────────────────────────────
-
-app.use("/api/ledger", LedgerRoutes);
+app.use("/api/ledger", ledgerRoutes);
 app.use("/api/auth", authRoutes);
 
 app.use("/api/product-types", productTypeRoutes);
@@ -125,13 +110,8 @@ app.use("/api/units", unitRoutes);
 app.use("/api/opening-stock", openingStockRoutes);
 app.use("/api/stock-receive", stockReceiveRoutes);
 app.use("/api/stock-issue", stockIssueRoutes);
-
-/* NEW API ENDPOINTS */
 app.use("/api/stock-demand", stockDemandRoutes);
-app.use(
-  "/api/reports/product-profit-loss",
-  productProfitLossReportRoutes
-);
+app.use("/api/reports/product-profit-loss", productProfitLossReportRoutes);
 
 app.use("/api/departments", departmentRoutes);
 app.use("/api/inventory-report", inventoryReportRoutes);
@@ -175,13 +155,7 @@ app.use("/api/production-returns", productionReturnInvoiceRoutes);
 app.use("/api/production-report", productionReportRoutes);
 
 app.use("/api/permissions", permissionsRoutes);
-
-/* ALL LEDGER SUMMARY ENDPOINT */
 app.use("/api/ledger-summary", allLedgerSummaryRoutes);
-
-// ─────────────────────────────────────────────────────────────
-// 404 HANDLER
-// ─────────────────────────────────────────────────────────────
 
 app.use((req, res) => {
   res.status(404).json({
@@ -190,10 +164,7 @@ app.use((req, res) => {
   });
 });
 
-// ─────────────────────────────────────────────────────────────
-// GLOBAL ERROR HANDLER
-// ─────────────────────────────────────────────────────────────
-
+// eslint-disable-next-line no-unused-vars
 app.use((err, req, res, next) => {
   console.error("Global error:", err);
 
@@ -204,15 +175,11 @@ app.use((err, req, res, next) => {
     });
   }
 
-  res.status(500).json({
+  return res.status(err.status || 500).json({
     success: false,
     message: err.message || "Server error",
   });
 });
-
-// ─────────────────────────────────────────────────────────────
-// SERVER
-// ─────────────────────────────────────────────────────────────
 
 const PORT = process.env.PORT || 5000;
 
