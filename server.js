@@ -176,6 +176,9 @@ const chartOfAccountsRoutes =
 const journalVoucherRoutes =
   require("./routes/journalVoucher");
 
+const chequeVoucherRoutes =
+  require("./routes/chequeVouchers");
+
 const cashBookRoutes =
   require("./routes/cashBook");
 
@@ -427,6 +430,11 @@ app.use(
 app.use(
   "/api/journal-vouchers",
   journalVoucherRoutes
+);
+
+app.use(
+  "/api/cheque-vouchers",
+  chequeVoucherRoutes
 );
 
 app.use(
