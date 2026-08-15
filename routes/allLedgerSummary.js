@@ -345,6 +345,18 @@ async function loadGeneralAccounts(fromDate, toDate) {
     WHERE account_cr_id IS NOT NULL
   `);
 
+  // A cheque reduces its selected ledger account on the issuance date.
+  // Payment rows only track clearance progress and do not deduct twice.
+  const chequeVouchers = await safeQuery(`
+    SELECT
+      account_id AS entity_id,
+      issuance_date AS tx_date,
+      0 AS debit,
+      COALESCE(total_amount, 0) AS credit
+    FROM cheque_vouchers
+    WHERE account_id IS NOT NULL
+  `);
+
   const extraOpeningMap = new Map(
     extraOpening.map((row) => [Number(row.entity_id), number(row.movement)])
   );
@@ -360,7 +372,7 @@ async function loadGeneralAccounts(fromDate, toDate) {
     ])
   );
 
-  vouchers.forEach((transaction) => {
+  [...vouchers, ...chequeVouchers].forEach((transaction) => {
     const bucket = buckets.get(Number(transaction.entity_id));
     if (bucket) applyTransaction(bucket, transaction, fromDate, toDate);
   });
