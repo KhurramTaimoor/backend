@@ -3,34 +3,32 @@ const cors = require("cors");
 
 const app = express();
 
-const allowedOrigins = new Set([
-  // New production frontend
+const allowedOrigins = [
   "https://alibirdcageofficial.online",
   "https://www.alibirdcageofficial.online",
   "https://app.alibirdcageofficial.online",
 
-  // Old domains - migration ke dauran rehne do
-  "https://app.alibirdcageofficial.store",
   "https://alibirdcageofficial.store",
   "https://www.alibirdcageofficial.store",
+  "https://app.alibirdcageofficial.store",
 
-  // Local development
   "http://localhost:5173",
   "http://127.0.0.1:5173",
-]);
+];
 
 const corsOptions = {
-  origin: function (origin, callback) {
-    // Postman, curl, server-to-server etc.
+  origin(origin, callback) {
+    console.log("REQUEST ORIGIN:", origin);
+
     if (!origin) {
       return callback(null, true);
     }
 
-    if (allowedOrigins.has(origin)) {
+    if (allowedOrigins.includes(origin)) {
       return callback(null, true);
     }
 
-    console.error("CORS BLOCKED ORIGIN:", origin);
+    console.error("CORS BLOCKED:", origin);
 
     return callback(
       new Error(`Not allowed by CORS: ${origin}`)
@@ -47,10 +45,10 @@ const corsOptions = {
   ],
 
   allowedHeaders: [
-    "Content-Type",
-    "Authorization",
-    "Accept",
     "Origin",
+    "Content-Type",
+    "Accept",
+    "Authorization",
     "X-Requested-With",
   ],
 
@@ -61,8 +59,8 @@ const corsOptions = {
 
 app.use(cors(corsOptions));
 
-// Preflight requests
-app.options("*", cors(corsOptions));
+// YE LINE MAT RAKHNA
+// app.options("*", cors(corsOptions));
 
 app.use(
   express.json({
