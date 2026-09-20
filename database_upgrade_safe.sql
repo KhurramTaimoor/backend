@@ -349,3 +349,204 @@ CREATE TABLE IF NOT EXISTS user_permissions (
 
 -- Keep both current and legacy product-type names populated.
 UPDATE product_types SET product_type_en = COALESCE(NULLIF(product_type_en,''), type_name), type_name = COALESCE(NULLIF(type_name,''), product_type_en);
+
+-- ---------------------------------------------------------------------------
+-- SAFE UPGRADE SECTION FOR AN EXISTING DATABASE
+-- No DROP/TRUNCATE/DELETE statements. Missing columns are added in-place.
+-- ---------------------------------------------------------------------------
+DELIMITER $$
+DROP PROCEDURE IF EXISTS AddColumnIfMissing$$
+CREATE PROCEDURE AddColumnIfMissing(IN p_table VARCHAR(64), IN p_column VARCHAR(64), IN p_definition TEXT)
+BEGIN
+  IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema=DATABASE() AND table_name=p_table)
+     AND NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema=DATABASE() AND table_name=p_table AND column_name=p_column) THEN
+    SET @sql = CONCAT('ALTER TABLE `', p_table, '` ADD COLUMN `', p_column, '` ', p_definition);
+    PREPARE stmt FROM @sql; EXECUTE stmt; DEALLOCATE PREPARE stmt;
+  END IF;
+END$$
+DROP PROCEDURE IF EXISTS ModifyColumnIfExists$$
+CREATE PROCEDURE ModifyColumnIfExists(IN p_table VARCHAR(64), IN p_column VARCHAR(64), IN p_definition TEXT)
+BEGIN
+  IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema=DATABASE() AND table_name=p_table AND column_name=p_column) THEN
+    SET @sql = CONCAT('ALTER TABLE `', p_table, '` MODIFY COLUMN `', p_column, '` ', p_definition);
+    PREPARE stmt FROM @sql; EXECUTE stmt; DEALLOCATE PREPARE stmt;
+  END IF;
+END$$
+DELIMITER ;
+
+-- Product/master compatibility. Legacy master-packing columns remain; current UI does not require them.
+CALL AddColumnIfMissing('product_types','product_type_en','VARCHAR(180) NULL');
+CALL AddColumnIfMissing('product_types','type_name','VARCHAR(180) NULL');
+CALL AddColumnIfMissing('products','description','TEXT NULL');
+CALL AddColumnIfMissing('products','product_type_id','INT NULL');
+CALL AddColumnIfMissing('products','category_id','INT NULL');
+CALL AddColumnIfMissing('products','unit_id','INT NULL');
+CALL AddColumnIfMissing('products','piece_rate','DECIMAL(14,2) NOT NULL DEFAULT 0');
+CALL AddColumnIfMissing('products','sale_unit','VARCHAR(30) NOT NULL DEFAULT ''single''');
+CALL AddColumnIfMissing('products','pieces_per_carton','DECIMAL(14,3) NOT NULL DEFAULT 0');
+CALL AddColumnIfMissing('products','master_packing_unit_id','INT NULL');
+CALL AddColumnIfMissing('products','master_packing_pieces','DECIMAL(14,3) NOT NULL DEFAULT 0');
+CALL AddColumnIfMissing('products','is_active','TINYINT(1) NOT NULL DEFAULT 1');
+CALL AddColumnIfMissing('products','updated_at','TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP');
+
+-- Supplier opening/closing balance support.
+CALL AddColumnIfMissing('suppliers','address','VARCHAR(500) NULL');
+CALL AddColumnIfMissing('suppliers','opening_balance','DECIMAL(14,2) NOT NULL DEFAULT 0');
+CALL AddColumnIfMissing('suppliers','opening_debit','DECIMAL(14,2) NOT NULL DEFAULT 0');
+CALL AddColumnIfMissing('suppliers','opening_credit','DECIMAL(14,2) NOT NULL DEFAULT 0');
+CALL AddColumnIfMissing('suppliers','updated_at','TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP');
+
+-- Named, customer-specific sales rate lists. price_options JSON/LONGTEXT includes single_rate.
+CALL AddColumnIfMissing('sales_rates','list_name','VARCHAR(180) NULL');
+CALL AddColumnIfMissing('sales_rates','customer_id','INT NULL');
+CALL AddColumnIfMissing('sales_rates','product_id','INT NULL');
+CALL AddColumnIfMissing('sales_rates','price_options','LONGTEXT NULL');
+CALL AddColumnIfMissing('sales_rates','updated_at','TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP');
+CALL ModifyColumnIfExists('sales_rates','product_item','VARCHAR(150) NULL');
+
+-- Named supplier purchase rate lists.
+CALL AddColumnIfMissing('purchase_rates','list_name','VARCHAR(180) NULL');
+CALL AddColumnIfMissing('purchase_rates','supplier_id','INT NULL');
+CALL AddColumnIfMissing('purchase_rates','supplier_name','VARCHAR(180) NULL');
+CALL AddColumnIfMissing('purchase_rates','product_id','INT NULL');
+CALL AddColumnIfMissing('purchase_rates','product_name','VARCHAR(180) NULL');
+CALL AddColumnIfMissing('purchase_rates','unit_id','INT NULL');
+CALL AddColumnIfMissing('purchase_rates','unit_name','VARCHAR(120) NULL');
+CALL AddColumnIfMissing('purchase_rates','category_id','INT NULL');
+CALL AddColumnIfMissing('purchase_rates','category_name','VARCHAR(180) NULL');
+CALL AddColumnIfMissing('purchase_rates','product_type_id','INT NULL');
+CALL AddColumnIfMissing('purchase_rates','type_name','VARCHAR(180) NULL');
+CALL AddColumnIfMissing('purchase_rates','rate','DECIMAL(14,2) NOT NULL DEFAULT 0');
+CALL AddColumnIfMissing('purchase_rates','quantity','DECIMAL(14,3) NOT NULL DEFAULT 0');
+CALL AddColumnIfMissing('purchase_rates','effective_date','DATE NULL');
+
+-- Sale Order invoice-style header and rows.
+CALL AddColumnIfMissing('sale_orders','reference_no','VARCHAR(120) NULL');
+CALL AddColumnIfMissing('sale_orders','party_type','VARCHAR(50) NULL DEFAULT ''customer''');
+CALL AddColumnIfMissing('sale_orders','party_id','INT NULL');
+CALL AddColumnIfMissing('sale_orders','party_name','VARCHAR(180) NULL');
+CALL AddColumnIfMissing('sale_orders','customer_type','VARCHAR(50) NULL');
+CALL AddColumnIfMissing('sale_orders','customer_name_en','VARCHAR(180) NULL');
+CALL AddColumnIfMissing('sale_orders','customer_id','INT NULL');
+CALL AddColumnIfMissing('sale_orders','employee_id','INT NULL');
+CALL AddColumnIfMissing('sale_orders','supplier_id','INT NULL');
+CALL AddColumnIfMissing('sale_orders','general_ledger_id','INT NULL');
+CALL AddColumnIfMissing('sale_orders','delivery_date','DATE NULL');
+CALL AddColumnIfMissing('sale_orders','shipment_to','VARCHAR(500) NULL');
+CALL AddColumnIfMissing('sale_orders','previous_balance','DECIMAL(14,2) NOT NULL DEFAULT 0');
+CALL AddColumnIfMissing('sale_orders','delivery_charges','DECIMAL(14,2) NOT NULL DEFAULT 0');
+CALL AddColumnIfMissing('sale_orders','discount','DECIMAL(14,2) NOT NULL DEFAULT 0');
+CALL AddColumnIfMissing('sale_orders','grand_total','DECIMAL(14,2) NOT NULL DEFAULT 0');
+CALL AddColumnIfMissing('sale_orders','payment_method','VARCHAR(50) NULL');
+CALL AddColumnIfMissing('sale_orders','advance_receive','DECIMAL(14,2) NOT NULL DEFAULT 0');
+CALL AddColumnIfMissing('sale_orders','payment_received','DECIMAL(14,2) NOT NULL DEFAULT 0');
+CALL AddColumnIfMissing('sale_orders','paid_amount','DECIMAL(14,2) NOT NULL DEFAULT 0');
+CALL AddColumnIfMissing('sale_orders','remaining_balance','DECIMAL(14,2) NOT NULL DEFAULT 0');
+CALL AddColumnIfMissing('sale_orders','payment_status','VARCHAR(50) NULL');
+CALL AddColumnIfMissing('sale_orders','payment_note','TEXT NULL');
+CALL AddColumnIfMissing('sale_orders','updated_at','TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP');
+
+-- Sale Order item rows used by demand and product-ledger reporting.
+CALL AddColumnIfMissing('sale_order_items','order_id','INT NULL');
+CALL AddColumnIfMissing('sale_order_items','product_type_id','INT NULL');
+CALL AddColumnIfMissing('sale_order_items','category_id','INT NULL');
+CALL AddColumnIfMissing('sale_order_items','product_id','INT NULL');
+CALL AddColumnIfMissing('sale_order_items','product_description','VARCHAR(500) NULL');
+CALL AddColumnIfMissing('sale_order_items','unit_id','INT NULL');
+CALL AddColumnIfMissing('sale_order_items','order_qty','DECIMAL(14,3) NOT NULL DEFAULT 0');
+CALL AddColumnIfMissing('sale_order_items','rate_mode','VARCHAR(40) NULL DEFAULT ''auto''');
+CALL AddColumnIfMissing('sale_order_items','rate','DECIMAL(14,2) NOT NULL DEFAULT 0');
+CALL AddColumnIfMissing('sale_order_items','debit','DECIMAL(14,2) NOT NULL DEFAULT 0');
+CALL AddColumnIfMissing('sale_order_items','credit','DECIMAL(14,2) NOT NULL DEFAULT 0');
+
+-- Sales invoice/return report and shipment fields.
+CALL AddColumnIfMissing('sales_invoices','reference_no','VARCHAR(120) NULL');
+CALL AddColumnIfMissing('sales_invoices','party_type','VARCHAR(50) NULL DEFAULT ''customer''');
+CALL AddColumnIfMissing('sales_invoices','party_id','INT NULL');
+CALL AddColumnIfMissing('sales_invoices','party_name','VARCHAR(180) NULL');
+CALL AddColumnIfMissing('sales_invoices','customer_id','INT NULL');
+CALL AddColumnIfMissing('sales_invoices','employee_id','INT NULL');
+CALL AddColumnIfMissing('sales_invoices','supplier_id','INT NULL');
+CALL AddColumnIfMissing('sales_invoices','general_ledger_id','INT NULL');
+CALL AddColumnIfMissing('sales_invoices','shipment_to','VARCHAR(500) NULL');
+CALL AddColumnIfMissing('sales_invoices','address','VARCHAR(500) NULL');
+CALL AddColumnIfMissing('sales_invoices','previous_balance','DECIMAL(14,2) NOT NULL DEFAULT 0');
+CALL AddColumnIfMissing('sales_invoices','delivery_charges','DECIMAL(14,2) NOT NULL DEFAULT 0');
+CALL AddColumnIfMissing('sales_invoices','invoice_total','DECIMAL(14,2) NOT NULL DEFAULT 0');
+CALL AddColumnIfMissing('sales_invoices','grand_total','DECIMAL(14,2) NOT NULL DEFAULT 0');
+CALL AddColumnIfMissing('sales_invoices','total_qty','DECIMAL(14,3) NOT NULL DEFAULT 0');
+CALL AddColumnIfMissing('sales_invoices','items_count','INT NOT NULL DEFAULT 0');
+CALL AddColumnIfMissing('sales_invoices','updated_at','TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP');
+CALL AddColumnIfMissing('sales_invoice_items','product_type_id','INT NULL');
+CALL AddColumnIfMissing('sales_invoice_items','product_description','VARCHAR(500) NULL');
+CALL AddColumnIfMissing('sales_invoice_items','description','VARCHAR(500) NULL');
+CALL AddColumnIfMissing('sales_invoice_items','qty','DECIMAL(14,3) NOT NULL DEFAULT 0');
+CALL AddColumnIfMissing('sales_invoice_items','quantity','DECIMAL(14,3) NOT NULL DEFAULT 0');
+
+-- Purchase invoice freight/discount/detail report fields.
+CALL AddColumnIfMissing('purchase_invoices','supplier_id','INT NULL');
+CALL AddColumnIfMissing('purchase_invoices','supplier_name','VARCHAR(180) NULL');
+CALL AddColumnIfMissing('purchase_invoices','reference_no','VARCHAR(120) NULL');
+CALL AddColumnIfMissing('purchase_invoices','address','VARCHAR(500) NULL');
+CALL AddColumnIfMissing('purchase_invoices','previous_balance','DECIMAL(14,2) NOT NULL DEFAULT 0');
+CALL AddColumnIfMissing('purchase_invoices','delivery_charges','DECIMAL(14,2) NOT NULL DEFAULT 0');
+CALL AddColumnIfMissing('purchase_invoices','freight','DECIMAL(14,2) NOT NULL DEFAULT 0');
+CALL AddColumnIfMissing('purchase_invoices','discount','DECIMAL(14,2) NOT NULL DEFAULT 0');
+CALL AddColumnIfMissing('purchase_invoices','invoice_total','DECIMAL(14,2) NOT NULL DEFAULT 0');
+CALL AddColumnIfMissing('purchase_invoices','grand_total','DECIMAL(14,2) NOT NULL DEFAULT 0');
+CALL AddColumnIfMissing('purchase_invoices','updated_at','TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP');
+CALL AddColumnIfMissing('purchase_invoice_items','product_description','VARCHAR(500) NULL');
+CALL AddColumnIfMissing('purchase_invoice_items','category_id','INT NULL');
+CALL AddColumnIfMissing('purchase_invoice_items','unit_id','INT NULL');
+CALL AddColumnIfMissing('purchase_invoice_items','product_type_id','INT NULL');
+
+-- Real stock movement traceability.
+CALL AddColumnIfMissing('stock_receive_items','product_id','INT NULL');
+CALL AddColumnIfMissing('stock_receive_items','category_id','INT NULL');
+CALL AddColumnIfMissing('stock_receive_items','unit_id','INT NULL');
+CALL AddColumnIfMissing('stock_receive_items','product_type_id','INT NULL');
+CALL AddColumnIfMissing('stock_receive_items','rate','DECIMAL(14,2) NOT NULL DEFAULT 0');
+CALL AddColumnIfMissing('stock_receive_items','total','DECIMAL(14,2) NOT NULL DEFAULT 0');
+CALL AddColumnIfMissing('stock_issue','issue_date','DATE NULL');
+CALL AddColumnIfMissing('stock_issue','reference_no','VARCHAR(120) NULL');
+CALL AddColumnIfMissing('stock_issue','total','DECIMAL(14,2) NOT NULL DEFAULT 0');
+CALL AddColumnIfMissing('stock_issue_items','product_id','INT NULL');
+CALL AddColumnIfMissing('stock_issue_items','category_id','INT NULL');
+CALL AddColumnIfMissing('stock_issue_items','unit_id','INT NULL');
+CALL AddColumnIfMissing('stock_issue_items','product_type_id','INT NULL');
+
+-- Production / return invoice-style multi-row workflow.
+CALL AddColumnIfMissing('production_invoices','assignee_type','VARCHAR(50) NULL');
+CALL AddColumnIfMissing('production_invoices','assignee_id','INT NULL');
+CALL AddColumnIfMissing('production_invoices','assignee_name','VARCHAR(180) NULL');
+CALL AddColumnIfMissing('production_invoices','remarks','TEXT NULL');
+CALL AddColumnIfMissing('production_invoices','total_qty','DECIMAL(14,3) NOT NULL DEFAULT 0');
+CALL AddColumnIfMissing('production_invoices','total_amount','DECIMAL(14,2) NOT NULL DEFAULT 0');
+CALL AddColumnIfMissing('production_invoices','updated_at','TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP');
+CALL AddColumnIfMissing('production_returns','production_invoice_id','INT NULL');
+CALL AddColumnIfMissing('production_returns','assignee_type','VARCHAR(50) NULL');
+CALL AddColumnIfMissing('production_returns','assignee_id','INT NULL');
+CALL AddColumnIfMissing('production_returns','assignee_name','VARCHAR(180) NULL');
+CALL AddColumnIfMissing('production_returns','total_qty','DECIMAL(14,3) NOT NULL DEFAULT 0');
+CALL AddColumnIfMissing('production_returns','total_amount','DECIMAL(14,2) NOT NULL DEFAULT 0');
+CALL AddColumnIfMissing('production_returns','updated_at','TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP');
+
+-- Assembly/BOM component workflow.
+CALL AddColumnIfMissing('assembly','product_id','INT NULL');
+CALL AddColumnIfMissing('assembly','bom_id','INT NULL');
+CALL AddColumnIfMissing('assembly','updated_at','TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP');
+
+-- Permission compatibility used by current API.
+CALL AddColumnIfMissing('user_permissions','employee_id','INT NULL');
+CALL AddColumnIfMissing('user_permissions','user_id','INT NULL');
+CALL AddColumnIfMissing('user_permissions','role_id','INT NULL');
+CALL AddColumnIfMissing('user_permissions','role','VARCHAR(50) NULL');
+CALL AddColumnIfMissing('user_permissions','access_level','VARCHAR(50) NULL');
+CALL AddColumnIfMissing('user_permissions','module_access','VARCHAR(255) NULL');
+
+UPDATE product_types
+SET product_type_en = COALESCE(NULLIF(product_type_en,''), type_name),
+    type_name = COALESCE(NULLIF(type_name,''), product_type_en);
+
+DROP PROCEDURE IF EXISTS AddColumnIfMissing;
+DROP PROCEDURE IF EXISTS ModifyColumnIfExists;

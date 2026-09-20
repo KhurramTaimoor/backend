@@ -74,8 +74,10 @@ const schemaReady = (async () => {
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`
   );
 })().catch((error) => {
+  // Do not crash the whole API when MySQL is temporarily unavailable.
+  // Individual requests will still return a normal 500 until the DB is reachable.
   console.error("Cheque voucher schema initialization failed:", error.message);
-  throw error;
+  return false;
 });
 
 const voucherSelect = `

@@ -1,6 +1,25 @@
-﻿const express = require("express");
+const express = require("express");
 const router = express.Router();
 const db = require("../db");
+
+const ensureAccountGroups = (req, res, next) => {
+  db.query(
+    `CREATE TABLE IF NOT EXISTS account_groups (
+      id INT AUTO_INCREMENT PRIMARY KEY,
+      group_name VARCHAR(180) NOT NULL,
+      parent_group VARCHAR(180) NULL,
+      type VARCHAR(80) NOT NULL,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`,
+    (err) => {
+      if (err) return res.status(500).json({ error: err.message });
+      next();
+    }
+  );
+};
+
+router.use(ensureAccountGroups);
 
 router.get("/", (req, res) => {
   db.query("SELECT * FROM account_groups ORDER BY id DESC", (err, results) => {

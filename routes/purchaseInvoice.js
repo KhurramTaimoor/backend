@@ -559,10 +559,17 @@ function normalizeItem(item, index) {
 
     product_name: cleanText(
       item.product_name ||
-        item.item_name ||
-        item.product_description ||
+        item.item_name
+    ),
+
+    product_description: cleanText(
+      item.product_description ||
         item.description
     ),
+
+    category_id: toPositiveId(item.category_id),
+    unit_id: toPositiveId(item.unit_id),
+    product_type_id: toPositiveId(item.product_type_id),
 
     category_name:
       cleanText(
@@ -731,6 +738,10 @@ async function insertItems(
         (
           invoice_id,
           product_id,
+          product_description,
+          category_id,
+          unit_id,
+          product_type_id,
           unit_name,
           category_name,
           type_name,
@@ -738,11 +749,15 @@ async function insertItems(
           rate,
           amount
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `,
       [
         invoiceId,
         item.product_id,
+        item.product_description || null,
+        item.category_id || null,
+        item.unit_id || null,
+        item.product_type_id || null,
         item.unit_name || null,
         item.category_name || null,
         item.type_name || null,
@@ -819,12 +834,12 @@ async function getInvoiceItems(
 
         product_description:
           cleanText(
-            row.product_name
+            row.product_description
           ),
 
         description:
           cleanText(
-            row.product_name
+            row.product_description
           ),
 
         category_name:
@@ -922,7 +937,7 @@ async function normalizeResponse(
         row.invoice_no
       ),
 
-    reference_no: "",
+    reference_no: cleanText(row.reference_no),
 
     party_type: "supplier",
     customer_type: "supplier",
@@ -944,15 +959,15 @@ async function normalizeResponse(
         row.invoice_date
     ),
 
-    address: "",
+    address: cleanText(row.address),
 
-    previous_balance: 0,
-    delivery_charges: 0,
-    discount: 0,
+    previous_balance: toNumber(row.previous_balance),
+    delivery_charges: toNumber(row.delivery_charges),
+    discount: toNumber(row.discount),
 
-    invoice_total: total,
+    invoice_total: toNumber(row.invoice_total, total),
     total_amount: total,
-    grand_total: total,
+    grand_total: toNumber(row.grand_total, total),
 
     total_qty: totalQty,
     items_count: items.length,
@@ -1041,13 +1056,16 @@ async function prepareRequest(
       0
     );
 
-  const total = toNumber(
-    firstDefined(
-      body.grand_total,
-      body.invoice_total,
-      body.total_amount
-    ),
+  const invoiceTotal = toNumber(
+    firstDefined(body.invoice_total, body.total_amount),
     calculated
+  );
+  const previousBalance = toNumber(body.previous_balance, 0);
+  const deliveryCharges = toNumber(firstDefined(body.delivery_charges, body.freight), 0);
+  const discount = toNumber(body.discount, 0);
+  const total = toNumber(
+    body.grand_total,
+    invoiceTotal + previousBalance + deliveryCharges - discount
   );
 
   const debit =
@@ -1084,6 +1102,14 @@ async function prepareRequest(
         new Date()
       ),
 
+    referenceNo: cleanText(body.reference_no),
+    supplierId: supplier.id || null,
+    address: cleanText(body.address),
+    previousBalance: Number(previousBalance.toFixed(2)),
+    deliveryCharges: Number(deliveryCharges.toFixed(2)),
+    discount: Number(discount.toFixed(2)),
+    invoiceTotal: Number(invoiceTotal.toFixed(2)),
+
     total: Number(
       total.toFixed(2)
     ),
@@ -1107,6 +1133,85 @@ async function prepareRequest(
     items,
   };
 }
+
+async function ensurePurchaseInvoiceSchema() {
+  await runQuery(db, `CREATE TABLE IF NOT EXISTS purchase_invoices (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    invoice_no VARCHAR(100) NOT NULL UNIQUE,
+    supplier_id INT NULL,
+    supplier_name VARCHAR(180) NOT NULL,
+    reference_no VARCHAR(120) NULL,
+    invoice_date DATE NOT NULL,
+    address VARCHAR(500) NULL,
+    previous_balance DECIMAL(14,2) NOT NULL DEFAULT 0,
+    delivery_charges DECIMAL(14,2) NOT NULL DEFAULT 0,
+    discount DECIMAL(14,2) NOT NULL DEFAULT 0,
+    invoice_total DECIMAL(14,2) NOT NULL DEFAULT 0,
+    total_amount DECIMAL(14,2) NOT NULL DEFAULT 0,
+    grand_total DECIMAL(14,2) NOT NULL DEFAULT 0,
+    debit DECIMAL(14,2) NOT NULL DEFAULT 0,
+    credit DECIMAL(14,2) NOT NULL DEFAULT 0,
+    status VARCHAR(50) NULL DEFAULT 'pending',
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+  ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`);
+
+  const invoiceColumns = await runQuery(db, "SHOW COLUMNS FROM purchase_invoices");
+  const invoiceSet = new Set(invoiceColumns.map((row) => row.Field));
+  const invoiceAdds = [
+    ["supplier_id", "ALTER TABLE purchase_invoices ADD COLUMN supplier_id INT NULL AFTER invoice_no"],
+    ["reference_no", "ALTER TABLE purchase_invoices ADD COLUMN reference_no VARCHAR(120) NULL AFTER supplier_name"],
+    ["address", "ALTER TABLE purchase_invoices ADD COLUMN address VARCHAR(500) NULL AFTER invoice_date"],
+    ["previous_balance", "ALTER TABLE purchase_invoices ADD COLUMN previous_balance DECIMAL(14,2) NOT NULL DEFAULT 0"],
+    ["delivery_charges", "ALTER TABLE purchase_invoices ADD COLUMN delivery_charges DECIMAL(14,2) NOT NULL DEFAULT 0"],
+    ["discount", "ALTER TABLE purchase_invoices ADD COLUMN discount DECIMAL(14,2) NOT NULL DEFAULT 0"],
+    ["invoice_total", "ALTER TABLE purchase_invoices ADD COLUMN invoice_total DECIMAL(14,2) NOT NULL DEFAULT 0"],
+    ["grand_total", "ALTER TABLE purchase_invoices ADD COLUMN grand_total DECIMAL(14,2) NOT NULL DEFAULT 0"],
+    ["debit", "ALTER TABLE purchase_invoices ADD COLUMN debit DECIMAL(14,2) NOT NULL DEFAULT 0"],
+    ["credit", "ALTER TABLE purchase_invoices ADD COLUMN credit DECIMAL(14,2) NOT NULL DEFAULT 0"],
+    ["status", "ALTER TABLE purchase_invoices ADD COLUMN status VARCHAR(50) NULL DEFAULT 'pending'"],
+  ];
+  for (const [column, sql] of invoiceAdds) if (!invoiceSet.has(column)) await runQuery(db, sql);
+
+  await runQuery(db, `CREATE TABLE IF NOT EXISTS purchase_invoice_items (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    invoice_id INT NOT NULL,
+    product_id INT NOT NULL,
+    product_description VARCHAR(500) NULL,
+    category_id INT NULL,
+    unit_id INT NULL,
+    product_type_id INT NULL,
+    unit_name VARCHAR(120) NULL,
+    category_name VARCHAR(180) NULL,
+    type_name VARCHAR(180) NULL,
+    quantity DECIMAL(14,3) NOT NULL DEFAULT 0,
+    rate DECIMAL(14,2) NOT NULL DEFAULT 0,
+    amount DECIMAL(14,2) NOT NULL DEFAULT 0,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    INDEX idx_purchase_item_invoice (invoice_id),
+    INDEX idx_purchase_item_product (product_id)
+  ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`);
+
+  const itemColumns = await runQuery(db, "SHOW COLUMNS FROM purchase_invoice_items");
+  const itemSet = new Set(itemColumns.map((row) => row.Field));
+  const itemAdds = [
+    ["product_description", "ALTER TABLE purchase_invoice_items ADD COLUMN product_description VARCHAR(500) NULL AFTER product_id"],
+    ["category_id", "ALTER TABLE purchase_invoice_items ADD COLUMN category_id INT NULL"],
+    ["unit_id", "ALTER TABLE purchase_invoice_items ADD COLUMN unit_id INT NULL"],
+    ["product_type_id", "ALTER TABLE purchase_invoice_items ADD COLUMN product_type_id INT NULL"],
+  ];
+  for (const [column, sql] of itemAdds) if (!itemSet.has(column)) await runQuery(db, sql);
+}
+
+router.use(async (req, res, next) => {
+  try {
+    await ensurePurchaseInvoiceSchema();
+    next();
+  } catch (error) {
+    console.error("Purchase invoice schema error:", error.message);
+    res.status(500).json({ success: false, message: "Purchase invoice database schema ready nahi ho saka.", error: error.message });
+  }
+});
 
 /*
 |--------------------------------------------------------------------------
@@ -1549,22 +1654,24 @@ router.post(
                     `
                       INSERT INTO purchase_invoices
                       (
-                        invoice_no,
-                        supplier_name,
-                        invoice_date,
-                        total_amount,
-                        debit,
-                        credit,
-                        status
+                        invoice_no, supplier_id, supplier_name, reference_no, invoice_date, address,
+                        previous_balance, delivery_charges, discount, invoice_total, total_amount, grand_total,
+                        debit, credit, status
                       )
-                      VALUES (?, ?, ?, ?, ?, ?, ?)
+                      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     `,
                     [
                       invoiceNo,
-                      prepared
-                        .supplierName,
-                      prepared
-                        .invoiceDate,
+                      prepared.supplierId,
+                      prepared.supplierName,
+                      prepared.referenceNo,
+                      prepared.invoiceDate,
+                      prepared.address,
+                      prepared.previousBalance,
+                      prepared.deliveryCharges,
+                      prepared.discount,
+                      prepared.invoiceTotal,
+                      prepared.total,
                       prepared.total,
                       prepared.debit,
                       prepared.credit,
@@ -1720,9 +1827,17 @@ router.put(
 
                 SET
                   invoice_no = ?,
+                  supplier_id = ?,
                   supplier_name = ?,
+                  reference_no = ?,
                   invoice_date = ?,
+                  address = ?,
+                  previous_balance = ?,
+                  delivery_charges = ?,
+                  discount = ?,
+                  invoice_total = ?,
                   total_amount = ?,
+                  grand_total = ?,
                   debit = ?,
                   credit = ?,
                   status = ?
@@ -1731,10 +1846,16 @@ router.put(
               `,
               [
                 invoiceNo,
-                prepared
-                  .supplierName,
-                prepared
-                  .invoiceDate,
+                prepared.supplierId,
+                prepared.supplierName,
+                prepared.referenceNo,
+                prepared.invoiceDate,
+                prepared.address,
+                prepared.previousBalance,
+                prepared.deliveryCharges,
+                prepared.discount,
+                prepared.invoiceTotal,
+                prepared.total,
                 prepared.total,
                 prepared.debit,
                 prepared.credit,

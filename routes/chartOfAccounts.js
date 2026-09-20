@@ -1,10 +1,10 @@
-﻿const express = require("express");
+const express = require("express");
 const router = express.Router();
 const db = require("../db");
 
 router.get("/", (req, res) => {
   const query = `
-    SELECT coa.*, ag.group_name 
+    SELECT coa.*, ag.group_name, ag.type AS account_type 
     FROM chart_of_accounts coa
     LEFT JOIN account_groups ag ON coa.group_id = ag.id
     ORDER BY coa.id DESC

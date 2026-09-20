@@ -255,33 +255,10 @@ router.post("/", async (req, res) => {
     const cleanMasterPackingPieces = toZeroNumber(master_packing_pieces);
     const cleanActive = cleanIsActive(is_active);
 
-    if (cleanMasterPackingUnitId && cleanMasterPackingPieces <= 0) {
-      return res.status(400).json({
-        message: "Master packing pieces required hain.",
-      });
-    }
-
-    if (!cleanMasterPackingUnitId && cleanMasterPackingPieces > 0) {
-      return res.status(400).json({
-        message: "Master packing unit required hai.",
-      });
-    }
-
-    const unitName = await getUnitName(cleanUnitId);
-    const masterPackingUnitName = await getUnitName(cleanMasterPackingUnitId);
-
-    let finalDescription = String(description || "").trim();
-
-    if (!finalDescription) {
-      finalDescription = makeDescription({
-        product_name: cleanProductName,
-        product_type_name: "",
-        category_name: "",
-        unit_name: unitName,
-        master_packing_unit_name: masterPackingUnitName,
-        master_packing_pieces: cleanMasterPackingPieces,
-      });
-    }
+    // Master-packing and auto-description are legacy fields. New UI no longer
+    // requires or auto-generates them, but the API still accepts them so old
+    // integrations/data remain compatible.
+    const finalDescription = String(description || "").trim();
 
     const cols = ["product_name"];
     const values = [cleanProductName];
@@ -378,6 +355,13 @@ router.put("/:id", async (req, res) => {
       master_packing_pieces = 0,
       is_active = 1,
     } = req.body;
+    const hasOwn = (key) => Object.prototype.hasOwnProperty.call(req.body, key);
+    const hasDescription = hasOwn("description");
+    const hasMasterPackingUnit = hasOwn("master_packing_unit_id");
+    const hasMasterPackingPieces = hasOwn("master_packing_pieces");
+    const hasLegacySaleUnit = hasOwn("sale_unit");
+    const hasLegacyPieces = hasOwn("pieces_per_carton");
+    const hasLegacyPieceRate = hasOwn("piece_rate");
 
     const cleanProductName = String(product_name || "").trim();
 
@@ -398,38 +382,15 @@ router.put("/:id", async (req, res) => {
     const cleanMasterPackingPieces = toZeroNumber(master_packing_pieces);
     const cleanActive = cleanIsActive(is_active);
 
-    if (cleanMasterPackingUnitId && cleanMasterPackingPieces <= 0) {
-      return res.status(400).json({
-        message: "Master packing pieces required hain.",
-      });
-    }
-
-    if (!cleanMasterPackingUnitId && cleanMasterPackingPieces > 0) {
-      return res.status(400).json({
-        message: "Master packing unit required hai.",
-      });
-    }
-
-    const unitName = await getUnitName(cleanUnitId);
-    const masterPackingUnitName = await getUnitName(cleanMasterPackingUnitId);
-
-    let finalDescription = String(description || "").trim();
-
-    if (!finalDescription) {
-      finalDescription = makeDescription({
-        product_name: cleanProductName,
-        product_type_name: "",
-        category_name: "",
-        unit_name: unitName,
-        master_packing_unit_name: masterPackingUnitName,
-        master_packing_pieces: cleanMasterPackingPieces,
-      });
-    }
+    // Master-packing and auto-description are legacy fields. New UI no longer
+    // requires or auto-generates them, but the API still accepts them so old
+    // integrations/data remain compatible.
+    const finalDescription = String(description || "").trim();
 
     const sets = ["product_name = ?"];
     const values = [cleanProductName];
 
-    if (await hasColumn("products", "description")) {
+    if (hasDescription && (await hasColumn("products", "description"))) {
       sets.push("description = ?");
       values.push(finalDescription);
     }
@@ -449,30 +410,30 @@ router.put("/:id", async (req, res) => {
       values.push(cleanUnitId);
     }
 
-    if (await hasColumn("products", "master_packing_unit_id")) {
+    if (hasMasterPackingUnit && (await hasColumn("products", "master_packing_unit_id"))) {
       sets.push("master_packing_unit_id = ?");
       values.push(cleanMasterPackingUnitId);
     }
 
-    if (await hasColumn("products", "master_packing_pieces")) {
+    if (hasMasterPackingPieces && (await hasColumn("products", "master_packing_pieces"))) {
       sets.push("master_packing_pieces = ?");
       values.push(cleanMasterPackingPieces);
     }
 
-    // old fields ko safe rakha hai
-    if (await hasColumn("products", "sale_unit")) {
+    // Legacy fields are only changed when an old client explicitly sends them.
+    if (hasLegacySaleUnit && (await hasColumn("products", "sale_unit"))) {
       sets.push("sale_unit = ?");
-      values.push(cleanMasterPackingUnitId ? "carton" : "single");
+      values.push(String(req.body.sale_unit || "single"));
     }
 
-    if (await hasColumn("products", "pieces_per_carton")) {
+    if (hasLegacyPieces && (await hasColumn("products", "pieces_per_carton"))) {
       sets.push("pieces_per_carton = ?");
-      values.push(cleanMasterPackingPieces);
+      values.push(toZeroNumber(req.body.pieces_per_carton));
     }
 
-    if (await hasColumn("products", "piece_rate")) {
+    if (hasLegacyPieceRate && (await hasColumn("products", "piece_rate"))) {
       sets.push("piece_rate = ?");
-      values.push(0);
+      values.push(toZeroNumber(req.body.piece_rate));
     }
 
     if (await hasColumn("products", "is_active")) {

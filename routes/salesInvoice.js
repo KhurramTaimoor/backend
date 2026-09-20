@@ -11,6 +11,67 @@ function runQuery(sql, params = []) {
   });
 }
 
+async function ensureSalesInvoiceSchema() {
+  await runQuery(`CREATE TABLE IF NOT EXISTS sales_invoices (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    invoice_no VARCHAR(100) NOT NULL UNIQUE,
+    reference_no VARCHAR(120) NULL,
+    party_type VARCHAR(40) NULL, party_id INT NULL, party_name VARCHAR(180) NULL,
+    customer_type VARCHAR(40) NULL, customer_name_en VARCHAR(180) NULL, customer_name VARCHAR(180) NULL,
+    customer_id INT NULL, employee_id INT NULL, supplier_id INT NULL, general_ledger_id INT NULL,
+    invoice_date DATE NULL, shipment_to VARCHAR(255) NULL, address VARCHAR(500) NULL,
+    previous_balance DECIMAL(14,2) NOT NULL DEFAULT 0, delivery_charges DECIMAL(14,2) NOT NULL DEFAULT 0,
+    discount DECIMAL(14,2) NOT NULL DEFAULT 0, invoice_total DECIMAL(14,2) NOT NULL DEFAULT 0,
+    total_amount DECIMAL(14,2) NOT NULL DEFAULT 0, grand_total DECIMAL(14,2) NOT NULL DEFAULT 0,
+    total_qty DECIMAL(14,3) NOT NULL DEFAULT 0, items_count INT NOT NULL DEFAULT 0,
+    status VARCHAR(50) NULL DEFAULT 'Pending', created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+  ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`);
+
+  await runQuery(`CREATE TABLE IF NOT EXISTS sales_invoice_items (
+    id INT AUTO_INCREMENT PRIMARY KEY, invoice_id INT NOT NULL, sr INT NOT NULL DEFAULT 1,
+    category_id INT NULL, product_id INT NOT NULL, product_name VARCHAR(180) NULL,
+    product_description VARCHAR(500) NULL, description VARCHAR(500) NULL, unit_id INT NULL,
+    sale_type VARCHAR(40) NULL DEFAULT 'single', carton_qty DECIMAL(14,3) NOT NULL DEFAULT 0,
+    pieces_qty DECIMAL(14,3) NOT NULL DEFAULT 0, qty DECIMAL(14,3) NOT NULL DEFAULT 0,
+    quantity DECIMAL(14,3) NOT NULL DEFAULT 0, pieces_per_carton DECIMAL(14,3) NOT NULL DEFAULT 0,
+    rate DECIMAL(14,2) NOT NULL DEFAULT 0, amount DECIMAL(14,2) NOT NULL DEFAULT 0,
+    debit DECIMAL(14,2) NOT NULL DEFAULT 0, credit DECIMAL(14,2) NOT NULL DEFAULT 0,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, INDEX idx_sales_item_invoice(invoice_id),
+    INDEX idx_sales_item_product(product_id)
+  ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`);
+
+  const invoiceCols = new Set((await runQuery('SHOW COLUMNS FROM sales_invoices')).map(r => r.Field));
+  const invoiceAdds = {
+    reference_no:'VARCHAR(120) NULL', party_type:'VARCHAR(40) NULL', party_id:'INT NULL', party_name:'VARCHAR(180) NULL',
+    customer_type:'VARCHAR(40) NULL', customer_name_en:'VARCHAR(180) NULL', customer_name:'VARCHAR(180) NULL',
+    customer_id:'INT NULL', employee_id:'INT NULL', supplier_id:'INT NULL', general_ledger_id:'INT NULL',
+    invoice_date:'DATE NULL', shipment_to:'VARCHAR(255) NULL', address:'VARCHAR(500) NULL',
+    previous_balance:'DECIMAL(14,2) NOT NULL DEFAULT 0', delivery_charges:'DECIMAL(14,2) NOT NULL DEFAULT 0',
+    discount:'DECIMAL(14,2) NOT NULL DEFAULT 0', invoice_total:'DECIMAL(14,2) NOT NULL DEFAULT 0',
+    total_amount:'DECIMAL(14,2) NOT NULL DEFAULT 0', grand_total:'DECIMAL(14,2) NOT NULL DEFAULT 0',
+    total_qty:'DECIMAL(14,3) NOT NULL DEFAULT 0', items_count:'INT NOT NULL DEFAULT 0', status:"VARCHAR(50) NULL DEFAULT 'Pending'",
+    created_at:'TIMESTAMP DEFAULT CURRENT_TIMESTAMP', updated_at:'TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP'
+  };
+  for (const [c,d] of Object.entries(invoiceAdds)) if (!invoiceCols.has(c)) await runQuery(`ALTER TABLE sales_invoices ADD COLUMN \`${c}\` ${d}`);
+
+  const itemCols = new Set((await runQuery('SHOW COLUMNS FROM sales_invoice_items')).map(r => r.Field));
+  const itemAdds = {
+    sr:'INT NOT NULL DEFAULT 1', category_id:'INT NULL', product_id:'INT NULL', product_name:'VARCHAR(180) NULL',
+    product_description:'VARCHAR(500) NULL', description:'VARCHAR(500) NULL', unit_id:'INT NULL', sale_type:"VARCHAR(40) NULL DEFAULT 'single'",
+    carton_qty:'DECIMAL(14,3) NOT NULL DEFAULT 0', pieces_qty:'DECIMAL(14,3) NOT NULL DEFAULT 0', qty:'DECIMAL(14,3) NOT NULL DEFAULT 0',
+    quantity:'DECIMAL(14,3) NOT NULL DEFAULT 0', pieces_per_carton:'DECIMAL(14,3) NOT NULL DEFAULT 0', rate:'DECIMAL(14,2) NOT NULL DEFAULT 0',
+    amount:'DECIMAL(14,2) NOT NULL DEFAULT 0', debit:'DECIMAL(14,2) NOT NULL DEFAULT 0', credit:'DECIMAL(14,2) NOT NULL DEFAULT 0',
+    created_at:'TIMESTAMP DEFAULT CURRENT_TIMESTAMP'
+  };
+  for (const [c,d] of Object.entries(itemAdds)) if (!itemCols.has(c)) await runQuery(`ALTER TABLE sales_invoice_items ADD COLUMN \`${c}\` ${d}`);
+}
+
+router.use(async (_req, res, next) => {
+  try { await ensureSalesInvoiceSchema(); next(); }
+  catch (err) { res.status(500).json({ success:false, message:'Sales invoice database schema ready nahi ho saka.', error:err.message }); }
+});
+
 const toNum = (v, fallback = 0) => {
   const n = Number(v);
   return Number.isFinite(n) ? n : fallback;
@@ -82,6 +143,7 @@ function normalizeItems(items = []) {
         sr: toNum(item.sr, index + 1),
         category_id: toNullableNum(item.category_id),
         product_id: toNullableNum(item.product_id),
+        product_name: cleanText(item.product_name || item.product || ""),
         product_description: cleanText(item.product_description || item.description || item.product_desc || ""),
         description: cleanText(item.description || item.product_description || item.product_desc || ""),
         unit_id: toNullableNum(item.unit_id),
@@ -179,14 +241,15 @@ async function insertInvoiceItems(invoiceId, items) {
   for (const item of items) {
     await runQuery(
       `INSERT INTO sales_invoice_items
-       (invoice_id, sr, category_id, product_id, product_description, description, unit_id, sale_type,
+       (invoice_id, sr, category_id, product_id, product_name, product_description, description, unit_id, sale_type,
         carton_qty, pieces_qty, qty, quantity, pieces_per_carton, rate, amount, debit, credit)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         invoiceId,
         item.sr,
         item.category_id,
         item.product_id,
+        item.product_name || null,
         item.product_description,
         item.description,
         item.unit_id,

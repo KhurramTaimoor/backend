@@ -332,7 +332,16 @@ async function getDropdownData() {
     runQuery(`SELECT * FROM customers ORDER BY id DESC`).catch(() => []),
     runQuery(`SELECT * FROM employees ORDER BY id DESC`).catch(() => []),
     runQuery(`SELECT * FROM suppliers ORDER BY id DESC`).catch(() => []),
-    runQuery(`SELECT * FROM general_ledgers ORDER BY id DESC`).catch(() => []),
+    runQuery(`
+      SELECT id, ledger_name, account_title, account_code, opening_balance FROM general_ledgers
+      UNION ALL
+      SELECT id, account_title AS ledger_name, account_title, account_code, opening_balance
+      FROM chart_of_accounts
+      WHERE NOT EXISTS (SELECT 1 FROM general_ledgers)
+      ORDER BY id DESC
+    `).catch(() =>
+      runQuery(`SELECT id, account_title AS ledger_name, account_title, account_code, opening_balance FROM chart_of_accounts ORDER BY account_title`).catch(() => [])
+    ),
   ]);
 
   return {

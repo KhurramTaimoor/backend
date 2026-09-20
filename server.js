@@ -201,6 +201,9 @@ const openingBalanceRoutes =
 const generalLedgerRoutes =
   require("./routes/generalLedger");
 
+const generalLedgersMasterRoutes =
+  require("./routes/generalLedgersMaster");
+
 const cashBookReportRoutes =
   require("./routes/cashBookReport");
 
@@ -481,6 +484,11 @@ app.use(
 );
 
 app.use(
+  "/api/general-ledgers",
+  generalLedgersMasterRoutes
+);
+
+app.use(
   "/api/cash-book-report",
   cashBookReportRoutes
 );
@@ -607,8 +615,12 @@ app.use((err, req, res, next) => {
 const PORT =
   process.env.PORT || 5000;
 
-app.listen(PORT, () => {
-  console.log(
-    `Server chal raha hai port ${PORT}`
-  );
-});
+if (require.main === module) {
+  app.listen(PORT, () => {
+    console.log(
+      `Server chal raha hai port ${PORT}`
+    );
+  });
+}
+
+module.exports = app;

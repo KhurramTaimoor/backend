@@ -1,99 +1,34 @@
-const express = require("express");
-const router = express.Router();
-const db = require("../db");
+const express=require('express');
+const router=express.Router();
+const db=require('../db');
+const q=(sql,p=[])=>new Promise((resolve,reject)=>db.query(sql,p,(e,r)=>e?reject(e):resolve(r)));
+const num=v=>{const n=Number(v||0);return Number.isFinite(n)?n:0};
+const clean=v=>String(v??'').trim();
+const today=()=>new Date().toISOString().slice(0,10);
 
-const ensureAssemblyColumns = () => {
-  db.query("SHOW COLUMNS FROM assembly LIKE 'product_name'", (err, results) => {
-    if (err) return;
-    if (!results || results.length === 0) {
-      db.query("ALTER TABLE assembly ADD COLUMN product_name VARCHAR(255) NULL AFTER assembly_no");
-    }
-  });
-
-  db.query("SHOW COLUMNS FROM assembly LIKE 'bom_ref'", (err, results) => {
-    if (err) return;
-    if (!results || results.length === 0) {
-      db.query("ALTER TABLE assembly ADD COLUMN bom_ref VARCHAR(100) NULL AFTER product_name");
-    }
-  });
-};
-
-ensureAssemblyColumns();
-
-router.get("/", (req, res) => {
-  db.query(
-    `SELECT
-       a.id,
-       a.assembly_no,
-       COALESCE(NULLIF(a.product_name, ''), p.product_name) AS product_name,
-       COALESCE(NULLIF(a.bom_ref, ''), CASE WHEN a.bom_id IS NOT NULL THEN CONCAT('BOM-', a.bom_id) ELSE '' END) AS bom_ref,
-       a.assembly_date,
-       a.qty_assembled,
-       a.warehouse,
-       a.remarks,
-       a.created_at
-     FROM assembly a
-     LEFT JOIN products p ON p.id = a.product_id
-     ORDER BY a.id DESC`,
-    (err, results) => {
-      if (err) return res.status(500).json({ error: err.message });
-      res.json(results);
-    }
-  );
-});
-
-router.post("/", (req, res) => {
-  const { assembly_no, product_name, bom_ref, assembly_date, qty_assembled, warehouse, remarks } = req.body;
-  if (!assembly_no) return res.status(400).json({ error: "Assembly no zaroori hai!" });
-  const today = new Date().toISOString().slice(0, 10);
-  db.query(
-    `INSERT INTO assembly (assembly_no, product_name, bom_ref, assembly_date, qty_assembled, warehouse, remarks) VALUES (?,?,?,?,?,?,?)`,
-    [
-      assembly_no,
-      product_name || null,
-      bom_ref || null,
-      assembly_date || today,
-      parseFloat(qty_assembled) || 0,
-      warehouse || null,
-      remarks || null,
-    ],
-    (err, result) => {
-      if (err) return res.status(500).json({ error: err.message });
-      res.json({ message: "Assembly save ho gayi!", id: result.insertId });
-    }
-  );
-});
-
-router.put("/:id", (req, res) => {
-  const { assembly_no, product_name, bom_ref, assembly_date, qty_assembled, warehouse, remarks } = req.body;
-  if (!assembly_no) return res.status(400).json({ error: "Assembly no zaroori hai!" });
-  const today = new Date().toISOString().slice(0, 10);
-  db.query(
-    `UPDATE assembly
-     SET assembly_no = ?, product_name = ?, bom_ref = ?, assembly_date = ?, qty_assembled = ?, warehouse = ?, remarks = ?
-     WHERE id = ?`,
-    [
-      assembly_no,
-      product_name || null,
-      bom_ref || null,
-      assembly_date || today,
-      parseFloat(qty_assembled) || 0,
-      warehouse || null,
-      remarks || null,
-      req.params.id,
-    ],
-    (err) => {
-      if (err) return res.status(500).json({ error: err.message });
-      res.json({ message: "Assembly update ho gayi!" });
-    }
-  );
-});
-
-router.delete("/:id", (req, res) => {
-  db.query("DELETE FROM assembly WHERE id = ?", [req.params.id], (err) => {
-    if (err) return res.status(500).json({ error: err.message });
-    res.json({ message: "Deleted!" });
-  });
-});
-
-module.exports = router;
+async function ensureSchema(){
+ await q(`CREATE TABLE IF NOT EXISTS assembly (
+   id INT AUTO_INCREMENT PRIMARY KEY,assembly_no VARCHAR(100) NOT NULL UNIQUE,product_name VARCHAR(255) NULL,bom_ref VARCHAR(100) NULL,
+   product_id INT NULL,bom_id INT NULL,assembly_date DATE NOT NULL,qty_assembled DECIMAL(14,3) NOT NULL DEFAULT 0,
+   warehouse VARCHAR(255) NULL,remarks TEXT NULL,created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+ ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`);
+ const cols=new Set((await q('SHOW COLUMNS FROM assembly')).map(r=>r.Field));
+ const adds=[['product_name',`ALTER TABLE assembly ADD COLUMN product_name VARCHAR(255) NULL`],['bom_ref',`ALTER TABLE assembly ADD COLUMN bom_ref VARCHAR(100) NULL`],['product_id',`ALTER TABLE assembly ADD COLUMN product_id INT NULL`],['bom_id',`ALTER TABLE assembly ADD COLUMN bom_id INT NULL`],['updated_at',`ALTER TABLE assembly ADD COLUMN updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP`]];for(const[c,s]of adds)if(!cols.has(c))await q(s);
+ await q(`CREATE TABLE IF NOT EXISTS assembly_items (
+   id INT AUTO_INCREMENT PRIMARY KEY,assembly_id INT NOT NULL,product_id INT NULL,product_name VARCHAR(180) NULL,
+   type_name VARCHAR(180) NULL,category_name VARCHAR(180) NULL,unit_name VARCHAR(120) NULL,qty_used DECIMAL(14,3) NOT NULL DEFAULT 0,
+   remarks VARCHAR(500) NULL,created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,INDEX idx_assembly_items_header(assembly_id),INDEX idx_assembly_items_product(product_id)
+ ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`);
+}
+router.use(async(_req,res,next)=>{try{await ensureSchema();next()}catch(e){res.status(500).json({success:false,message:e.message})}});
+async function products(){try{return await q(`SELECT p.id,p.product_name,p.product_type_id,p.category_id,p.unit_id,COALESCE(pt.product_type_en,pt.type_name,'') type_name,COALESCE(c.category_name,'') category_name,COALESCE(u.unit_name,u.symbol,'') unit_name FROM products p LEFT JOIN product_types pt ON pt.id=p.product_type_id LEFT JOIN categories c ON c.id=p.category_id LEFT JOIN units u ON u.id=p.unit_id ORDER BY p.product_name`)}catch{return q(`SELECT id,product_name FROM products ORDER BY product_name`).catch(()=>[])}}
+async function maps(ids){if(!ids.length)return{};const rows=await q(`SELECT * FROM assembly_items WHERE assembly_id IN (?) ORDER BY assembly_id,id`,[ids]);return rows.reduce((m,r)=>{(m[r.assembly_id]??=[]).push(r);return m},{})}
+async function one(id){const rs=await q(`SELECT a.*,COALESCE(p.product_name,a.product_name,'') output_product_name FROM assembly a LEFT JOIN products p ON p.id=a.product_id WHERE a.id=?`,[id]);if(!rs[0])return null;const m=await maps([Number(id)]);return{...rs[0],assembly_date:String(rs[0].assembly_date||'').slice(0,10),items:m[id]||m[Number(id)]||[]}}
+router.get('/setup',async(_req,res)=>{try{res.json({success:true,data:{products:await products(),boms:await q(`SELECT id,product_name,bom_type,batch_size,raw_material,qty,rate,total,labor_cost FROM bom ORDER BY id DESC`).catch(()=>[])}})}catch(e){res.status(500).json({success:false,message:e.message})}});
+router.get('/',async(_req,res)=>{try{const rs=await q(`SELECT a.*,COALESCE(p.product_name,a.product_name,'') output_product_name FROM assembly a LEFT JOIN products p ON p.id=a.product_id ORDER BY a.id DESC`);const m=await maps(rs.map(x=>x.id));const data=rs.map(r=>({...r,assembly_date:String(r.assembly_date||'').slice(0,10),items:m[r.id]||[]}));res.json({success:true,data,records:data})}catch(e){res.status(500).json({success:false,message:e.message})}});
+const normItems=items=>(Array.isArray(items)?items:[]).map(it=>({product_id:Number(it.product_id)||null,product_name:clean(it.product_name),type_name:clean(it.type_name),category_name:clean(it.category_name),unit_name:clean(it.unit_name),qty_used:Math.max(num(it.qty_used??it.quantity),0),remarks:clean(it.remarks)})).filter(x=>x.product_id&&x.qty_used>0);
+async function saveItems(id,items){for(const it of items)await q(`INSERT INTO assembly_items (assembly_id,product_id,product_name,type_name,category_name,unit_name,qty_used,remarks) VALUES (?,?,?,?,?,?,?,?)`,[id,it.product_id,it.product_name,it.type_name||null,it.category_name||null,it.unit_name||null,it.qty_used,it.remarks||null])}
+router.post('/',async(req,res)=>{try{const no=clean(req.body.assembly_no),productId=Number(req.body.product_id)||null,items=normItems(req.body.items),qty=Math.max(num(req.body.qty_assembled),0);if(!no||!productId||qty<=0||!items.length)return res.status(400).json({success:false,message:'Assembly No, output product, output qty and at least one input component are required.'});if(items.some(x=>x.product_id===productId)&&items.length===1)return res.status(400).json({success:false,message:'Assembly cannot consist only of the same output product as its input.'});const ps=await products();const p=ps.find(x=>Number(x.id)===productId);const r=await q(`INSERT INTO assembly (assembly_no,product_name,bom_ref,product_id,bom_id,assembly_date,qty_assembled,warehouse,remarks) VALUES (?,?,?,?,?,?,?,?,?)`,[no,p?.product_name||clean(req.body.product_name)||null,clean(req.body.bom_ref)||null,productId,Number(req.body.bom_id)||null,clean(req.body.assembly_date)||today(),qty,clean(req.body.warehouse)||null,clean(req.body.remarks)||null]);await saveItems(r.insertId,items);res.status(201).json({success:true,message:'Assembly saved.',data:await one(r.insertId)})}catch(e){res.status(e.code==='ER_DUP_ENTRY'?409:500).json({success:false,message:e.code==='ER_DUP_ENTRY'?'Assembly No already exists.':e.message})}});
+router.put('/:id',async(req,res)=>{try{const current=await one(req.params.id);if(!current)return res.status(404).json({success:false,message:'Assembly not found.'});const no=clean(req.body.assembly_no),productId=Number(req.body.product_id)||null,items=normItems(req.body.items),qty=Math.max(num(req.body.qty_assembled),0);if(!no||!productId||qty<=0||!items.length)return res.status(400).json({success:false,message:'Assembly No, output product, output qty and at least one input component are required.'});const ps=await products();const p=ps.find(x=>Number(x.id)===productId);await q(`UPDATE assembly SET assembly_no=?,product_name=?,bom_ref=?,product_id=?,bom_id=?,assembly_date=?,qty_assembled=?,warehouse=?,remarks=? WHERE id=?`,[no,p?.product_name||clean(req.body.product_name)||null,clean(req.body.bom_ref)||null,productId,Number(req.body.bom_id)||null,clean(req.body.assembly_date)||today(),qty,clean(req.body.warehouse)||null,clean(req.body.remarks)||null,req.params.id]);await q(`DELETE FROM assembly_items WHERE assembly_id=?`,[req.params.id]);await saveItems(req.params.id,items);res.json({success:true,message:'Assembly updated.',data:await one(req.params.id)})}catch(e){res.status(500).json({success:false,message:e.message})}});
+router.delete('/:id',async(req,res)=>{try{await q(`DELETE FROM assembly_items WHERE assembly_id=?`,[req.params.id]);await q(`DELETE FROM assembly WHERE id=?`,[req.params.id]);res.json({success:true,message:'Deleted.'})}catch(e){res.status(500).json({success:false,message:e.message})}});
+module.exports=router;
