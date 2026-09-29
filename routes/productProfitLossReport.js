@@ -29,6 +29,13 @@ const makeKey = ({ product_id, product_name }) => {
   return `name:${normalizeName(product_name) || "unknown"}`;
 };
 
+const dateClause = (column, from, to, params) => {
+  const parts = [];
+  if (from) { parts.push(`${column} >= ?`); params.push(from); }
+  if (to) { parts.push(`${column} <= ?`); params.push(to); }
+  return parts.length ? ` AND ${parts.join(" AND ")}` : "";
+};
+
 async function tableExists(tableName) {
   const rows = await queryAsync(
     `
@@ -125,9 +132,11 @@ function ensureProduct(bucket, row, productMap = {}) {
   return record;
 }
 
-async function applySalesInvoices(bucket, productMap) {
+async function applySalesInvoices(bucket, productMap, from, to) {
   if (!(await tableExists("sales_invoice_items"))) return;
 
+  const params = [];
+  const dateFilter = dateClause("si.invoice_date", from, to, params);
   const rows = await queryAsync(
     `
     SELECT
@@ -139,8 +148,11 @@ async function applySalesInvoices(bucket, productMap) {
       sii.pieces_qty,
       sii.amount
     FROM sales_invoice_items sii
+    JOIN sales_invoices si ON si.id = sii.invoice_id
     LEFT JOIN products p ON p.id = sii.product_id
-    `
+    WHERE 1=1 ${dateFilter}
+    `,
+    params
   );
 
   rows.forEach((row) => {
@@ -152,19 +164,25 @@ async function applySalesInvoices(bucket, productMap) {
   });
 }
 
-async function applySalesReturns(bucket, productMap) {
+async function applySalesReturns(bucket, productMap, from, to) {
   if (!(await tableExists("sales_returns"))) return;
 
+  const params = [];
+  const dateFilter = dateClause("sr.return_date", from, to, params);
   const rows = await queryAsync(
     `
     SELECT
       sr.product_id,
       COALESCE(sr.product_name, p.product_name, '') AS product_name,
+      sr.category_name,
+      sr.unit_name,
       sr.return_qty,
       sr.return_amount
     FROM sales_returns sr
     LEFT JOIN products p ON p.id = sr.product_id
-    `
+    WHERE 1=1 ${dateFilter}
+    `,
+    params
   );
 
   rows.forEach((row) => {
@@ -176,11 +194,13 @@ async function applySalesReturns(bucket, productMap) {
   });
 }
 
-async function applyPurchaseInvoices(bucket, productMap) {
+async function applyPurchaseInvoices(bucket, productMap, from, to) {
   if (!(await tableExists("purchase_invoice_items"))) return;
 
   // IMPORTANT: purchase_invoice_items table does NOT have product_name column,
   // so product name is taken from products table through product_id.
+  const params = [];
+  const dateFilter = dateClause("pi.invoice_date", from, to, params);
   const rows = await queryAsync(
     `
     SELECT
@@ -193,8 +213,11 @@ async function applyPurchaseInvoices(bucket, productMap) {
       pii.rate,
       pii.amount
     FROM purchase_invoice_items pii
+    JOIN purchase_invoices pi ON pi.id = pii.invoice_id
     LEFT JOIN products p ON p.id = pii.product_id
-    `
+    WHERE 1=1 ${dateFilter}
+    `,
+    params
   );
 
   rows.forEach((row) => {
@@ -209,11 +232,13 @@ async function applyPurchaseInvoices(bucket, productMap) {
   });
 }
 
-async function applyPurchaseReturns(bucket, productMap) {
+async function applyPurchaseReturns(bucket, productMap, from, to) {
   if (!(await tableExists("purchase_return_items"))) return;
 
   // IMPORTANT: purchase_return_items table does NOT have product_name column,
   // so product name is taken from products table through product_id.
+  const params = [];
+  const dateFilter = dateClause("pr.return_date", from, to, params);
   const rows = await queryAsync(
     `
     SELECT
@@ -226,8 +251,11 @@ async function applyPurchaseReturns(bucket, productMap) {
       pri.rate,
       pri.amount
     FROM purchase_return_items pri
+    JOIN purchase_returns pr ON pr.id = pri.return_id
     LEFT JOIN products p ON p.id = pri.product_id
-    `
+    WHERE 1=1 ${dateFilter}
+    `,
+    params
   );
 
   rows.forEach((row) => {
@@ -274,13 +302,15 @@ async function applyPurchaseRates(bucket, productMap) {
 // GET /api/reports/product-profit-loss
 router.get("/", async (req, res) => {
   try {
+    const from = clean(req.query.from_date).slice(0, 10);
+    const to = clean(req.query.to_date).slice(0, 10);
     const productMap = await loadProductMap();
     const bucket = {};
 
-    await applySalesInvoices(bucket, productMap);
-    await applySalesReturns(bucket, productMap);
-    await applyPurchaseInvoices(bucket, productMap);
-    await applyPurchaseReturns(bucket, productMap);
+    await applySalesInvoices(bucket, productMap, from, to);
+    await applySalesReturns(bucket, productMap, from, to);
+    await applyPurchaseInvoices(bucket, productMap, from, to);
+    await applyPurchaseReturns(bucket, productMap, from, to);
     await applyPurchaseRates(bucket, productMap);
 
     const rows = Object.values(bucket)

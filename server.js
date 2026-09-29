@@ -24,7 +24,7 @@ app.use((req, res, next) => {
 
   res.setHeader(
     "Access-Control-Allow-Headers",
-    "Origin, X-Requested-With, Content-Type, Accept, Authorization"
+    "Origin, X-Requested-With, Content-Type, Accept, Authorization, X-User-Id, X-User-Name, X-User-Role"
   );
 
   /*
@@ -56,6 +56,17 @@ app.use(
     limit: "10mb",
   })
 );
+
+/*
+|--------------------------------------------------------------------------
+| Audit Trail
+|--------------------------------------------------------------------------
+| Records all successful create/update/delete API actions with user/date/time.
+|--------------------------------------------------------------------------
+*/
+
+const auditTrail = require("./Middleware/auditTrail");
+app.use(auditTrail);
 
 /*
 |--------------------------------------------------------------------------
@@ -267,6 +278,12 @@ const permissionsRoutes =
 const authRoutes =
   require("./routes/authRoutes");
 
+const transactionHistoryRoutes =
+  require("./routes/transactionHistory");
+
+const accountProfilesRoutes =
+  require("./routes/accountProfiles");
+
 /*
 |--------------------------------------------------------------------------
 | Authentication API
@@ -276,6 +293,16 @@ const authRoutes =
 app.use(
   "/api/auth",
   authRoutes
+);
+
+app.use(
+  "/api/transaction-history",
+  transactionHistoryRoutes
+);
+
+app.use(
+  "/api/account-profiles",
+  accountProfilesRoutes
 );
 
 /*

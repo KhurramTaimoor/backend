@@ -72,6 +72,18 @@ router.use(async (_req, res, next) => {
   catch (err) { res.status(500).json({ success:false, message:'Sales invoice database schema ready nahi ho saka.', error:err.message }); }
 });
 
+
+async function generateNextInvoiceNo() {
+  const rows = await runQuery(`SELECT invoice_no FROM sales_invoices ORDER BY id DESC`);
+  let max = 0;
+  for (const row of rows) {
+    const value = String(row.invoice_no || '');
+    const match = value.match(/(?:SI[- ]?|sales-invoice)(\d+)/i) || value.match(/(\d+)$/);
+    if (match) max = Math.max(max, Number(match[1]) || 0);
+  }
+  return `SI-${String(max + 1).padStart(6, '0')}`;
+}
+
 const toNum = (v, fallback = 0) => {
   const n = Number(v);
   return Number.isFinite(n) ? n : fallback;
@@ -292,6 +304,17 @@ router.get("/", async (req, res) => {
   }
 });
 
+
+// GET /api/sales-invoices/next-number
+router.get("/next-number", async (_req, res) => {
+  try {
+    const invoice_no = await generateNextInvoiceNo();
+    res.json({ success: true, invoice_no });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message || "Could not generate invoice number." });
+  }
+});
+
 // GET /api/sales-invoices/customer/:partyType/:partyId
 router.get("/customer/:partyType/:partyId", async (req, res) => {
   try {
@@ -387,6 +410,7 @@ router.get("/:id", async (req, res) => {
 router.post("/", async (req, res) => {
   try {
     const payload = buildInvoicePayload(req.body);
+    payload.invoice_no = await generateNextInvoiceNo();
     const items = normalizeItems(req.body.items || req.body.invoice_items || req.body.sales_invoice_items);
 
     if (!payload.invoice_no) return res.status(400).json({ success: false, message: "Invoice No zaroori hai." });
