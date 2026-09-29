@@ -309,7 +309,11 @@ router.post("/lists/:listName/assign-customers", async (req, res) => {
       .filter((id) => id > 0))];
 
     await query("DELETE FROM sales_rate_list_customers WHERE list_name = ?", [listName]);
+    // One customer keeps one default rate-list assignment. Re-assigning a name
+    // automatically moves it from the previous list, while invoice-level override
+    // remains available for exceptional/general-account sales.
     for (const customerId of ids) {
+      await query("DELETE FROM sales_rate_list_customers WHERE customer_id = ?", [customerId]);
       await query(
         "INSERT IGNORE INTO sales_rate_list_customers (list_name, customer_id) VALUES (?, ?)",
         [listName, customerId]

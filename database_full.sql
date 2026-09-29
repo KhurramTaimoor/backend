@@ -194,7 +194,7 @@ CREATE TABLE IF NOT EXISTS sales_invoices (
   id INT AUTO_INCREMENT PRIMARY KEY, invoice_no VARCHAR(100) NOT NULL, reference_no VARCHAR(120) NULL,
   party_type VARCHAR(50) NULL DEFAULT 'customer', party_id INT NULL, party_name VARCHAR(180) NULL, customer_type VARCHAR(50) NULL,
   customer_name_en VARCHAR(180) NULL, customer_name VARCHAR(180) NULL, customer_id INT NULL, employee_id INT NULL, supplier_id INT NULL, general_ledger_id INT NULL,
-  invoice_date DATE NULL, due_date DATE NULL, shipment_to VARCHAR(500) NULL, address VARCHAR(500) NULL, previous_balance DECIMAL(14,2) DEFAULT 0,
+  invoice_date DATE NULL, due_date DATE NULL, shipment_to VARCHAR(500) NULL, rate_list_name VARCHAR(180) NULL, address VARCHAR(500) NULL, previous_balance DECIMAL(14,2) DEFAULT 0,
   delivery_charges DECIMAL(14,2) DEFAULT 0, discount DECIMAL(14,2) DEFAULT 0, invoice_total DECIMAL(14,2) DEFAULT 0,
   total_amount DECIMAL(14,2) DEFAULT 0, grand_total DECIMAL(14,2) DEFAULT 0, total_qty DECIMAL(14,3) DEFAULT 0, items_count INT DEFAULT 0,
   status VARCHAR(50) NULL DEFAULT 'Posted', created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
