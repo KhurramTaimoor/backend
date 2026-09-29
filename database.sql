@@ -159,6 +159,11 @@ CREATE TABLE IF NOT EXISTS sales_rates (
   price_options LONGTEXT NULL, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
   INDEX idx_sales_rates_customer(customer_id), INDEX idx_sales_rates_product(product_id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+CREATE TABLE IF NOT EXISTS sales_rate_list_customers (
+  id INT AUTO_INCREMENT PRIMARY KEY, list_name VARCHAR(180) NOT NULL, customer_id INT NOT NULL,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, UNIQUE KEY uniq_rate_list_customer (list_name, customer_id),
+  INDEX idx_rate_list_assign_list(list_name), INDEX idx_rate_list_assign_customer(customer_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 CREATE TABLE IF NOT EXISTS purchase_rates (
   id INT AUTO_INCREMENT PRIMARY KEY, list_name VARCHAR(180) NULL, supplier_id INT NULL, supplier_name VARCHAR(180) NULL,
   product_id INT NULL, product_name VARCHAR(180) NULL, unit_id INT NULL, unit_name VARCHAR(120) NULL, category_id INT NULL,
@@ -189,7 +194,7 @@ CREATE TABLE IF NOT EXISTS sales_invoices (
   id INT AUTO_INCREMENT PRIMARY KEY, invoice_no VARCHAR(100) NOT NULL, reference_no VARCHAR(120) NULL,
   party_type VARCHAR(50) NULL DEFAULT 'customer', party_id INT NULL, party_name VARCHAR(180) NULL, customer_type VARCHAR(50) NULL,
   customer_name_en VARCHAR(180) NULL, customer_name VARCHAR(180) NULL, customer_id INT NULL, employee_id INT NULL, supplier_id INT NULL, general_ledger_id INT NULL,
-  invoice_date DATE NULL, shipment_to VARCHAR(500) NULL, address VARCHAR(500) NULL, previous_balance DECIMAL(14,2) DEFAULT 0,
+  invoice_date DATE NULL, due_date DATE NULL, shipment_to VARCHAR(500) NULL, address VARCHAR(500) NULL, previous_balance DECIMAL(14,2) DEFAULT 0,
   delivery_charges DECIMAL(14,2) DEFAULT 0, discount DECIMAL(14,2) DEFAULT 0, invoice_total DECIMAL(14,2) DEFAULT 0,
   total_amount DECIMAL(14,2) DEFAULT 0, grand_total DECIMAL(14,2) DEFAULT 0, total_qty DECIMAL(14,3) DEFAULT 0, items_count INT DEFAULT 0,
   status VARCHAR(50) NULL DEFAULT 'Posted', created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,

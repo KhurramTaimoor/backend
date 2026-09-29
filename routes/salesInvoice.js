@@ -19,7 +19,7 @@ async function ensureSalesInvoiceSchema() {
     party_type VARCHAR(40) NULL, party_id INT NULL, party_name VARCHAR(180) NULL,
     customer_type VARCHAR(40) NULL, customer_name_en VARCHAR(180) NULL, customer_name VARCHAR(180) NULL,
     customer_id INT NULL, employee_id INT NULL, supplier_id INT NULL, general_ledger_id INT NULL,
-    invoice_date DATE NULL, shipment_to VARCHAR(255) NULL, address VARCHAR(500) NULL,
+    invoice_date DATE NULL, due_date DATE NULL, shipment_to VARCHAR(255) NULL, address VARCHAR(500) NULL,
     previous_balance DECIMAL(14,2) NOT NULL DEFAULT 0, delivery_charges DECIMAL(14,2) NOT NULL DEFAULT 0,
     discount DECIMAL(14,2) NOT NULL DEFAULT 0, invoice_total DECIMAL(14,2) NOT NULL DEFAULT 0,
     total_amount DECIMAL(14,2) NOT NULL DEFAULT 0, grand_total DECIMAL(14,2) NOT NULL DEFAULT 0,
@@ -46,7 +46,7 @@ async function ensureSalesInvoiceSchema() {
     reference_no:'VARCHAR(120) NULL', party_type:'VARCHAR(40) NULL', party_id:'INT NULL', party_name:'VARCHAR(180) NULL',
     customer_type:'VARCHAR(40) NULL', customer_name_en:'VARCHAR(180) NULL', customer_name:'VARCHAR(180) NULL',
     customer_id:'INT NULL', employee_id:'INT NULL', supplier_id:'INT NULL', general_ledger_id:'INT NULL',
-    invoice_date:'DATE NULL', shipment_to:'VARCHAR(255) NULL', address:'VARCHAR(500) NULL',
+    invoice_date:'DATE NULL', due_date:'DATE NULL', shipment_to:'VARCHAR(255) NULL', address:'VARCHAR(500) NULL',
     previous_balance:'DECIMAL(14,2) NOT NULL DEFAULT 0', delivery_charges:'DECIMAL(14,2) NOT NULL DEFAULT 0',
     discount:'DECIMAL(14,2) NOT NULL DEFAULT 0', invoice_total:'DECIMAL(14,2) NOT NULL DEFAULT 0',
     total_amount:'DECIMAL(14,2) NOT NULL DEFAULT 0', grand_total:'DECIMAL(14,2) NOT NULL DEFAULT 0',
@@ -200,6 +200,7 @@ function buildInvoicePayload(body) {
     supplier_id: partyType === "supplier" ? toNullableNum(body.supplier_id || partyId) : null,
     general_ledger_id: partyType === "general_ledger" ? toNullableNum(body.general_ledger_id || partyId) : null,
     invoice_date: toDateOrNull(body.invoice_date),
+    due_date: toDateOrNull(body.due_date),
     shipment_to: cleanText(body.shipment_to),
     address: cleanText(body.address),
     previous_balance: previousBalance,
@@ -241,6 +242,7 @@ async function getInvoiceById(id) {
   return {
     ...inv,
     invoice_date: formatDate(inv.invoice_date),
+      due_date: formatDate(inv.due_date),
     party_type: getInvoicePartyType(inv),
     party_id: getInvoicePartyId(inv),
     party_name: getInvoicePartyName(inv),
@@ -289,6 +291,7 @@ router.get("/", async (req, res) => {
     const data = invoices.map((inv) => ({
       ...inv,
       invoice_date: formatDate(inv.invoice_date),
+      due_date: formatDate(inv.due_date),
       party_type: getInvoicePartyType(inv),
       party_id: getInvoicePartyId(inv),
       party_name: getInvoicePartyName(inv),
@@ -354,6 +357,7 @@ router.get("/customer/:partyType/:partyId", async (req, res) => {
     const data = invoices.map((inv) => ({
       ...inv,
       invoice_date: formatDate(inv.invoice_date),
+      due_date: formatDate(inv.due_date),
       party_type: getInvoicePartyType(inv),
       party_id: getInvoicePartyId(inv),
       party_name: getInvoicePartyName(inv),
@@ -380,6 +384,7 @@ router.post("/bulk-print-data", async (req, res) => {
     const data = invoices.map((inv) => ({
       ...inv,
       invoice_date: formatDate(inv.invoice_date),
+      due_date: formatDate(inv.due_date),
       party_type: getInvoicePartyType(inv),
       party_id: getInvoicePartyId(inv),
       party_name: getInvoicePartyName(inv),
@@ -422,9 +427,9 @@ router.post("/", async (req, res) => {
     const result = await runQuery(
       `INSERT INTO sales_invoices
        (invoice_no, reference_no, party_type, party_id, party_name, customer_type, customer_name_en, customer_name,
-        customer_id, employee_id, supplier_id, general_ledger_id, invoice_date, shipment_to, address,
+        customer_id, employee_id, supplier_id, general_ledger_id, invoice_date, due_date, shipment_to, address,
         previous_balance, delivery_charges, discount, invoice_total, total_amount, grand_total, total_qty, items_count, status)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         payload.invoice_no,
         payload.reference_no,
@@ -439,6 +444,7 @@ router.post("/", async (req, res) => {
         payload.supplier_id,
         payload.general_ledger_id,
         payload.invoice_date,
+        payload.due_date,
         payload.shipment_to,
         payload.address,
         payload.previous_balance,
@@ -480,7 +486,7 @@ router.put("/:id", async (req, res) => {
       `UPDATE sales_invoices SET
         invoice_no = ?, reference_no = ?, party_type = ?, party_id = ?, party_name = ?, customer_type = ?,
         customer_name_en = ?, customer_name = ?, customer_id = ?, employee_id = ?, supplier_id = ?, general_ledger_id = ?,
-        invoice_date = ?, shipment_to = ?, address = ?, previous_balance = ?, delivery_charges = ?, discount = ?,
+        invoice_date = ?, due_date = ?, shipment_to = ?, address = ?, previous_balance = ?, delivery_charges = ?, discount = ?,
         invoice_total = ?, total_amount = ?, grand_total = ?, total_qty = ?, items_count = ?, status = ?
        WHERE id = ?`,
       [
@@ -497,6 +503,7 @@ router.put("/:id", async (req, res) => {
         payload.supplier_id,
         payload.general_ledger_id,
         payload.invoice_date,
+        payload.due_date,
         payload.shipment_to,
         payload.address,
         payload.previous_balance,
