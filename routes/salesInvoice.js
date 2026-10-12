@@ -1,3 +1,4 @@
+
 const express = require("express");
 const router = express.Router();
 const db = require("../db");
@@ -21,7 +22,9 @@ async function ensureSalesInvoiceSchema() {
     customer_id INT NULL, employee_id INT NULL, supplier_id INT NULL, general_ledger_id INT NULL,
     invoice_date DATE NULL, due_date DATE NULL, shipment_to VARCHAR(255) NULL, rate_list_name VARCHAR(180) NULL, address VARCHAR(500) NULL,
     previous_balance DECIMAL(14,2) NOT NULL DEFAULT 0, delivery_charges DECIMAL(14,2) NOT NULL DEFAULT 0,
-    discount DECIMAL(14,2) NOT NULL DEFAULT 0, invoice_total DECIMAL(14,2) NOT NULL DEFAULT 0,
+    discount DECIMAL(14,2) NOT NULL DEFAULT 0,
+    discount_type VARCHAR(20) NOT NULL DEFAULT 'flat', discount_value DECIMAL(14,2) NOT NULL DEFAULT 0,
+    invoice_total DECIMAL(14,2) NOT NULL DEFAULT 0,
     total_amount DECIMAL(14,2) NOT NULL DEFAULT 0, grand_total DECIMAL(14,2) NOT NULL DEFAULT 0,
     total_qty DECIMAL(14,3) NOT NULL DEFAULT 0, items_count INT NOT NULL DEFAULT 0,
     status VARCHAR(50) NULL DEFAULT 'Pending', created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -48,12 +51,24 @@ async function ensureSalesInvoiceSchema() {
     customer_id:'INT NULL', employee_id:'INT NULL', supplier_id:'INT NULL', general_ledger_id:'INT NULL',
     invoice_date:'DATE NULL', due_date:'DATE NULL', shipment_to:'VARCHAR(255) NULL', rate_list_name:'VARCHAR(180) NULL', address:'VARCHAR(500) NULL',
     previous_balance:'DECIMAL(14,2) NOT NULL DEFAULT 0', delivery_charges:'DECIMAL(14,2) NOT NULL DEFAULT 0',
-    discount:'DECIMAL(14,2) NOT NULL DEFAULT 0', invoice_total:'DECIMAL(14,2) NOT NULL DEFAULT 0',
+    discount:'DECIMAL(14,2) NOT NULL DEFAULT 0', discount_type:"VARCHAR(20) NOT NULL DEFAULT 'flat'",
+    discount_value:'DECIMAL(14,2) NOT NULL DEFAULT 0', invoice_total:'DECIMAL(14,2) NOT NULL DEFAULT 0',
     total_amount:'DECIMAL(14,2) NOT NULL DEFAULT 0', grand_total:'DECIMAL(14,2) NOT NULL DEFAULT 0',
     total_qty:'DECIMAL(14,3) NOT NULL DEFAULT 0', items_count:'INT NOT NULL DEFAULT 0', status:"VARCHAR(50) NULL DEFAULT 'Pending'",
     created_at:'TIMESTAMP DEFAULT CURRENT_TIMESTAMP', updated_at:'TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP'
   };
-  for (const [c,d] of Object.entries(invoiceAdds)) if (!invoiceCols.has(c)) await runQuery(`ALTER TABLE sales_invoices ADD COLUMN \`${c}\` ${d}`);
+
+  const legacyDiscountValueMissing = !invoiceCols.has("discount_value");
+
+  for (const [c,d] of Object.entries(invoiceAdds)) {
+    if (!invoiceCols.has(c)) {
+      await runQuery(`ALTER TABLE sales_invoices ADD COLUMN \`${c}\` ${d}`);
+    }
+  }
+
+  if (legacyDiscountValueMissing) {
+    await runQuery(`UPDATE sales_invoices SET discount_value = COALESCE(discount, 0) WHERE discount_type = 'flat'`);
+  }
 
   const itemCols = new Set((await runQuery('SHOW COLUMNS FROM sales_invoice_items')).map(r => r.Field));
   const itemAdds = {
@@ -64,23 +79,37 @@ async function ensureSalesInvoiceSchema() {
     amount:'DECIMAL(14,2) NOT NULL DEFAULT 0', debit:'DECIMAL(14,2) NOT NULL DEFAULT 0', credit:'DECIMAL(14,2) NOT NULL DEFAULT 0',
     created_at:'TIMESTAMP DEFAULT CURRENT_TIMESTAMP'
   };
-  for (const [c,d] of Object.entries(itemAdds)) if (!itemCols.has(c)) await runQuery(`ALTER TABLE sales_invoice_items ADD COLUMN \`${c}\` ${d}`);
+
+  for (const [c,d] of Object.entries(itemAdds)) {
+    if (!itemCols.has(c)) {
+      await runQuery(`ALTER TABLE sales_invoice_items ADD COLUMN \`${c}\` ${d}`);
+    }
+  }
 }
 
 router.use(async (_req, res, next) => {
-  try { await ensureSalesInvoiceSchema(); next(); }
-  catch (err) { res.status(500).json({ success:false, message:'Sales invoice database schema ready nahi ho saka.', error:err.message }); }
+  try {
+    await ensureSalesInvoiceSchema();
+    next();
+  } catch (err) {
+    res.status(500).json({
+      success:false,
+      message:'Sales invoice database schema ready nahi ho saka.',
+      error:err.message
+    });
+  }
 });
-
 
 async function generateNextInvoiceNo() {
   const rows = await runQuery(`SELECT invoice_no FROM sales_invoices ORDER BY id DESC`);
   let max = 0;
+
   for (const row of rows) {
     const value = String(row.invoice_no || '');
     const match = value.match(/(?:SI[- ]?|sales-invoice)(\d+)/i) || value.match(/(\d+)$/);
     if (match) max = Math.max(max, Number(match[1]) || 0);
   }
+
   return `SI-${String(max + 1).padStart(6, '0')}`;
 }
 
@@ -179,8 +208,23 @@ function buildInvoicePayload(body) {
   const invoiceTotal = toNum(body.invoice_total, items.reduce((sum, item) => sum + toNum(item.amount), 0));
   const previousBalance = toNum(body.previous_balance);
   const deliveryCharges = toNum(body.delivery_charges ?? body.deliveryCharges);
-  const discount = toNum(body.discount);
-  const grandTotal = toNum(body.grand_total, invoiceTotal + previousBalance + deliveryCharges - discount);
+
+  // Discount amount aur type separate save honge.
+  const discountType = body.discount_type === "percent" ? "percent" : "flat";
+  const rawDiscountValue = body.discount_value ?? body.discount;
+  const discountValue = Math.max(0, toNum(rawDiscountValue));
+
+  if (discountType === "percent" && discountValue > 100) {
+    const error = new Error("Percentage discount cannot exceed 100%.");
+    error.status = 400;
+    throw error;
+  }
+
+  const discount = Math.round((discountType === "percent"
+    ? invoiceTotal * discountValue / 100
+    : discountValue) * 100) / 100;
+
+  const grandTotal = invoiceTotal + previousBalance + deliveryCharges - discount;
 
   const partyType = normalizePartyType(body.party_type || body.customer_type);
   const partyId = toNullableNum(body.party_id);
@@ -207,6 +251,8 @@ function buildInvoicePayload(body) {
     previous_balance: previousBalance,
     delivery_charges: deliveryCharges,
     discount,
+    discount_type: discountType,
+    discount_value: discountValue,
     invoice_total: invoiceTotal,
     total_amount: invoiceTotal,
     grand_total: grandTotal,
@@ -226,10 +272,12 @@ async function getItemsForInvoiceIds(invoiceIds) {
   );
 
   const map = {};
+
   rows.forEach((row) => {
     if (!map[row.invoice_id]) map[row.invoice_id] = [];
     map[row.invoice_id].push(row);
   });
+
   return map;
 }
 
@@ -243,7 +291,7 @@ async function getInvoiceById(id) {
   return {
     ...inv,
     invoice_date: formatDate(inv.invoice_date),
-      due_date: formatDate(inv.due_date),
+    due_date: formatDate(inv.due_date),
     party_type: getInvoicePartyType(inv),
     party_id: getInvoicePartyId(inv),
     party_name: getInvoicePartyName(inv),
@@ -303,11 +351,10 @@ router.get("/", async (req, res) => {
 
     res.json({ success: true, data, invoices: data });
   } catch (err) {
-    console.error("❌ GET /sales-invoices:", err);
+    console.error("GET /sales-invoices:", err);
     res.status(500).json({ success: false, message: err.message || "Failed to load sales invoices." });
   }
 });
-
 
 // GET /api/sales-invoices/next-number
 router.get("/next-number", async (_req, res) => {
@@ -355,6 +402,7 @@ router.get("/customer/:partyType/:partyId", async (req, res) => {
     );
 
     const itemsMap = await getItemsForInvoiceIds(invoices.map((inv) => inv.id));
+
     const data = invoices.map((inv) => ({
       ...inv,
       invoice_date: formatDate(inv.invoice_date),
@@ -368,7 +416,7 @@ router.get("/customer/:partyType/:partyId", async (req, res) => {
 
     res.json({ success: true, data, invoices: data });
   } catch (err) {
-    console.error("❌ GET /sales-invoices/customer:", err);
+    console.error("GET /sales-invoices/customer:", err);
     res.status(500).json({ success: false, message: err.message || "Failed to load customer invoices." });
   }
 });
@@ -376,10 +424,22 @@ router.get("/customer/:partyType/:partyId", async (req, res) => {
 // POST /api/sales-invoices/bulk-print-data
 router.post("/bulk-print-data", async (req, res) => {
   try {
-    const ids = Array.isArray(req.body?.ids) ? req.body.ids.map(Number).filter((id) => id > 0) : [];
-    if (!ids.length) return res.status(400).json({ success: false, message: "Invoice ids zaroori hain." });
+    const ids = Array.isArray(req.body?.ids)
+      ? req.body.ids.map(Number).filter((id) => id > 0)
+      : [];
 
-    const invoices = await runQuery(`SELECT * FROM sales_invoices WHERE id IN (?) ORDER BY id DESC`, [ids]);
+    if (!ids.length) {
+      return res.status(400).json({
+        success: false,
+        message: "Invoice ids zaroori hain."
+      });
+    }
+
+    const invoices = await runQuery(
+      `SELECT * FROM sales_invoices WHERE id IN (?) ORDER BY id DESC`,
+      [ids]
+    );
+
     const itemsMap = await getItemsForInvoiceIds(invoices.map((inv) => inv.id));
 
     const data = invoices.map((inv) => ({
@@ -395,8 +455,11 @@ router.post("/bulk-print-data", async (req, res) => {
 
     res.json({ success: true, data, invoices: data });
   } catch (err) {
-    console.error("❌ POST /sales-invoices/bulk-print-data:", err);
-    res.status(500).json({ success: false, message: err.message || "Bulk print data load failed." });
+    console.error("POST /sales-invoices/bulk-print-data:", err);
+    res.status(500).json({
+      success: false,
+      message: err.message || "Bulk print data load failed."
+    });
   }
 });
 
@@ -404,11 +467,21 @@ router.post("/bulk-print-data", async (req, res) => {
 router.get("/:id", async (req, res) => {
   try {
     const invoice = await getInvoiceById(req.params.id);
-    if (!invoice) return res.status(404).json({ success: false, message: "Sales invoice nahi mili." });
+
+    if (!invoice) {
+      return res.status(404).json({
+        success: false,
+        message: "Sales invoice nahi mili."
+      });
+    }
+
     res.json({ success: true, data: invoice, invoice });
   } catch (err) {
-    console.error(`❌ GET /sales-invoices/${req.params.id}:`, err);
-    res.status(500).json({ success: false, message: err.message || "Failed to load sales invoice." });
+    console.error(`GET /sales-invoices/${req.params.id}:`, err);
+    res.status(500).json({
+      success: false,
+      message: err.message || "Failed to load sales invoice."
+    });
   }
 });
 
@@ -417,20 +490,38 @@ router.post("/", async (req, res) => {
   try {
     const payload = buildInvoicePayload(req.body);
     payload.invoice_no = await generateNextInvoiceNo();
-    const items = normalizeItems(req.body.items || req.body.invoice_items || req.body.sales_invoice_items);
 
-    if (!payload.invoice_no) return res.status(400).json({ success: false, message: "Invoice No zaroori hai." });
-    if (!payload.party_type || !payload.party_id || !payload.party_name) {
-      return res.status(400).json({ success: false, message: "Customer Type aur Name zaroori hain." });
+    const items = normalizeItems(
+      req.body.items || req.body.invoice_items || req.body.sales_invoice_items
+    );
+
+    if (!payload.invoice_no) {
+      return res.status(400).json({
+        success: false,
+        message: "Invoice No zaroori hai."
+      });
     }
-    if (!items.length) return res.status(400).json({ success: false, message: "Kam az kam ek product zaroori hai." });
+
+    if (!payload.party_type || !payload.party_id || !payload.party_name) {
+      return res.status(400).json({
+        success: false,
+        message: "Customer Type aur Name zaroori hain."
+      });
+    }
+
+    if (!items.length) {
+      return res.status(400).json({
+        success: false,
+        message: "Kam az kam ek product zaroori hai."
+      });
+    }
 
     const result = await runQuery(
       `INSERT INTO sales_invoices
        (invoice_no, reference_no, party_type, party_id, party_name, customer_type, customer_name_en, customer_name,
         customer_id, employee_id, supplier_id, general_ledger_id, invoice_date, due_date, shipment_to, rate_list_name, address,
-        previous_balance, delivery_charges, discount, invoice_total, total_amount, grand_total, total_qty, items_count, status)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        previous_balance, delivery_charges, discount, discount_type, discount_value, invoice_total, total_amount, grand_total, total_qty, items_count, status)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         payload.invoice_no,
         payload.reference_no,
@@ -452,6 +543,8 @@ router.post("/", async (req, res) => {
         payload.previous_balance,
         payload.delivery_charges,
         payload.discount,
+        payload.discount_type,
+        payload.discount_value,
         payload.invoice_total,
         payload.total_amount,
         payload.grand_total,
@@ -462,13 +555,23 @@ router.post("/", async (req, res) => {
     );
 
     const invoiceId = result.insertId;
+
     await insertInvoiceItems(invoiceId, items);
 
     const invoice = await getInvoiceById(invoiceId);
-    res.json({ success: true, message: "Sales invoice save ho gayi!", data: invoice, invoice });
+
+    res.json({
+      success: true,
+      message: "Sales invoice save ho gayi!",
+      data: invoice,
+      invoice
+    });
   } catch (err) {
-    console.error("❌ POST /sales-invoices:", err);
-    res.status(500).json({ success: false, message: err.message || "Sales invoice save failed." });
+    console.error("POST /sales-invoices:", err);
+    res.status(err.status === 400 ? 400 : 500).json({
+      success: false,
+      message: err.message || "Sales invoice save failed."
+    });
   }
 });
 
@@ -476,19 +579,37 @@ router.post("/", async (req, res) => {
 router.put("/:id", async (req, res) => {
   try {
     const payload = buildInvoicePayload(req.body);
-    const items = normalizeItems(req.body.items || req.body.invoice_items || req.body.sales_invoice_items);
 
-    if (!payload.invoice_no) return res.status(400).json({ success: false, message: "Invoice No zaroori hai." });
-    if (!payload.party_type || !payload.party_id || !payload.party_name) {
-      return res.status(400).json({ success: false, message: "Customer Type aur Name zaroori hain." });
+    const items = normalizeItems(
+      req.body.items || req.body.invoice_items || req.body.sales_invoice_items
+    );
+
+    if (!payload.invoice_no) {
+      return res.status(400).json({
+        success: false,
+        message: "Invoice No zaroori hai."
+      });
     }
-    if (!items.length) return res.status(400).json({ success: false, message: "Kam az kam ek product zaroori hai." });
+
+    if (!payload.party_type || !payload.party_id || !payload.party_name) {
+      return res.status(400).json({
+        success: false,
+        message: "Customer Type aur Name zaroori hain."
+      });
+    }
+
+    if (!items.length) {
+      return res.status(400).json({
+        success: false,
+        message: "Kam az kam ek product zaroori hai."
+      });
+    }
 
     await runQuery(
       `UPDATE sales_invoices SET
         invoice_no = ?, reference_no = ?, party_type = ?, party_id = ?, party_name = ?, customer_type = ?,
         customer_name_en = ?, customer_name = ?, customer_id = ?, employee_id = ?, supplier_id = ?, general_ledger_id = ?,
-        invoice_date = ?, due_date = ?, shipment_to = ?, rate_list_name = ?, address = ?, previous_balance = ?, delivery_charges = ?, discount = ?,
+        invoice_date = ?, due_date = ?, shipment_to = ?, rate_list_name = ?, address = ?, previous_balance = ?, delivery_charges = ?, discount = ?, discount_type = ?, discount_value = ?,
         invoice_total = ?, total_amount = ?, grand_total = ?, total_qty = ?, items_count = ?, status = ?
        WHERE id = ?`,
       [
@@ -512,6 +633,8 @@ router.put("/:id", async (req, res) => {
         payload.previous_balance,
         payload.delivery_charges,
         payload.discount,
+        payload.discount_type,
+        payload.discount_value,
         payload.invoice_total,
         payload.total_amount,
         payload.grand_total,
@@ -522,26 +645,53 @@ router.put("/:id", async (req, res) => {
       ]
     );
 
-    await runQuery(`DELETE FROM sales_invoice_items WHERE invoice_id = ?`, [req.params.id]);
+    await runQuery(
+      `DELETE FROM sales_invoice_items WHERE invoice_id = ?`,
+      [req.params.id]
+    );
+
     await insertInvoiceItems(req.params.id, items);
 
     const invoice = await getInvoiceById(req.params.id);
-    res.json({ success: true, message: "Sales invoice update ho gayi!", data: invoice, invoice });
+
+    res.json({
+      success: true,
+      message: "Sales invoice update ho gayi!",
+      data: invoice,
+      invoice
+    });
   } catch (err) {
-    console.error(`❌ PUT /sales-invoices/${req.params.id}:`, err);
-    res.status(500).json({ success: false, message: err.message || "Sales invoice update failed." });
+    console.error(`PUT /sales-invoices/${req.params.id}:`, err);
+    res.status(err.status === 400 ? 400 : 500).json({
+      success: false,
+      message: err.message || "Sales invoice update failed."
+    });
   }
 });
 
 // DELETE /api/sales-invoices/:id
 router.delete("/:id", async (req, res) => {
   try {
-    await runQuery(`DELETE FROM sales_invoice_items WHERE invoice_id = ?`, [req.params.id]).catch(() => {});
-    await runQuery(`DELETE FROM sales_invoices WHERE id = ?`, [req.params.id]);
-    res.json({ success: true, message: "Sales invoice delete ho gayi!" });
+    await runQuery(
+      `DELETE FROM sales_invoice_items WHERE invoice_id = ?`,
+      [req.params.id]
+    ).catch(() => {});
+
+    await runQuery(
+      `DELETE FROM sales_invoices WHERE id = ?`,
+      [req.params.id]
+    );
+
+    res.json({
+      success: true,
+      message: "Sales invoice delete ho gayi!"
+    });
   } catch (err) {
-    console.error(`❌ DELETE /sales-invoices/${req.params.id}:`, err);
-    res.status(500).json({ success: false, message: err.message || "Sales invoice delete failed." });
+    console.error(`DELETE /sales-invoices/${req.params.id}:`, err);
+    res.status(500).json({
+      success: false,
+      message: err.message || "Sales invoice delete failed."
+    });
   }
 });
 
