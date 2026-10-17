@@ -87,7 +87,8 @@ router.get('/transactions', async (_req, res) => {
       DATE_FORMAT(jv.voucher_date,'%Y-%m-%d') AS date,
       jv.voucher_no AS reference, COALESCE(NULLIF(l.description,''), jv.narration, '') AS description,
       l.debit, l.credit, 'Journal Voucher' AS status, jv.id AS voucher_id
-      FROM journal_voucher_lines l JOIN journal_vouchers jv ON jv.id=l.journal_voucher_id`);
+      FROM journal_voucher_lines l JOIN journal_vouchers jv ON jv.id=l.journal_voucher_id
+      WHERE l.account_type IS NULL OR LOWER(TRIM(l.account_type)) NOT IN ('customer','supplier','employee')`);
     await optional(`SELECT CONCAT('JV-', jv.id) AS transaction_id,
       jv.account_dr_id AS account_id, DATE_FORMAT(jv.voucher_date,'%Y-%m-%d') AS date,
       jv.voucher_no AS reference, jv.narration AS description,
@@ -175,7 +176,10 @@ router.delete('/:id', async (req, res) => {
     ];
     for (const [table, col] of references) {
       try {
-        const found = await query(`SELECT 1 FROM \`${table}\` WHERE \`${col}\`=? LIMIT 1`, [id]);
+        const extraFilter = table === 'journal_voucher_lines'
+          ? " AND (account_type IS NULL OR LOWER(TRIM(account_type)) NOT IN ('customer','supplier','employee'))"
+          : '';
+        const found = await query(`SELECT 1 FROM \`${table}\` WHERE \`${col}\`=?${extraFilter} LIMIT 1`, [id]);
         if (found.length) return res.status(409).json({ error: 'Account has transactions. It cannot be deleted.' });
       } catch (err) {
         if (err.code !== 'ER_NO_SUCH_TABLE' && err.code !== 'ER_BAD_FIELD_ERROR') throw err;
