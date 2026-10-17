@@ -138,8 +138,7 @@ const ACCOUNT_TYPES = {
   general_ledger: {
     table: "chart_of_accounts",
     idColumn: "id",
-    nameExpression:
-      "CONCAT(COALESCE(NULLIF(account_code, ''), ''), CASE WHEN account_code IS NULL OR account_code = '' THEN '' ELSE ' - ' END, account_title)",
+    nameExpression: "account_title",
     label: "General Ledger",
   },
   supplier: {
@@ -225,7 +224,7 @@ async function getLookups(connection) {
           customer_name_en,
           phone,
           city_en,
-          CONCAT(customer_name_en, CASE WHEN phone IS NULL OR phone = '' THEN '' ELSE CONCAT(' — ', phone) END) AS display_name
+          customer_name_en AS display_name
         FROM customers
         ORDER BY customer_name_en ASC
       `
@@ -240,11 +239,7 @@ async function getLookups(connection) {
           coa.group_id,
           ag.group_name,
           coa.opening_balance,
-          CONCAT(
-            COALESCE(NULLIF(coa.account_code, ''), ''),
-            CASE WHEN coa.account_code IS NULL OR coa.account_code = '' THEN '' ELSE ' — ' END,
-            coa.account_title
-          ) AS display_name
+          coa.account_title AS display_name
         FROM chart_of_accounts coa
         LEFT JOIN account_groups ag
           ON ag.id = coa.group_id
@@ -258,7 +253,7 @@ async function getLookups(connection) {
           id,
           supplier_name,
           phone,
-          CONCAT(supplier_name, CASE WHEN phone IS NULL OR phone = '' THEN '' ELSE CONCAT(' — ', phone) END) AS display_name
+          supplier_name AS display_name
         FROM suppliers
         ORDER BY supplier_name ASC
       `
@@ -271,7 +266,7 @@ async function getLookups(connection) {
           full_name,
           phone,
           designation,
-          CONCAT(full_name, CASE WHEN designation IS NULL OR designation = '' THEN '' ELSE CONCAT(' — ', designation) END) AS display_name
+          full_name AS display_name
         FROM employees
         ORDER BY full_name ASC
       `
@@ -436,8 +431,8 @@ async function prepareItems(connection, body) {
         account.account_type_label,
       account_id: item.account_id,
       account_name: account.display_name,
-      description:
-        item.description || account.display_name,
+      // Never infer description from the account name: only user-entered text.
+      description: item.description,
       receive: Number(item.receive.toFixed(2)),
       paid: Number(item.paid.toFixed(2)),
     });
@@ -512,13 +507,8 @@ async function insertVoucherItems(
       ]
     );
 
-    const legacyDescription = [
-      voucherNo,
-      `${item.account_type_label}: ${item.account_name}`,
-      item.description,
-    ]
-      .filter(Boolean)
-      .join(" | ");
+    // Mirror only the manually entered description in the old cash_book table.
+    const legacyDescription = item.description;
 
     const legacyResult = await runQuery(
       connection,
@@ -617,18 +607,31 @@ async function getVoucherById(connection, voucherId) {
     connection,
     `
       SELECT
-        id,
-        voucher_id,
-        line_no,
-        account_type,
-        account_id,
-        account_name_snapshot AS account_name,
-        description,
-        receive,
-        paid
-      FROM cash_book_voucher_items
-      WHERE voucher_id = ?
-      ORDER BY line_no ASC, id ASC
+        cbvi.id,
+        cbvi.voucher_id,
+        cbvi.line_no,
+        cbvi.account_type,
+        cbvi.account_id,
+        COALESCE(
+          NULLIF(CASE
+            WHEN cbvi.account_type = 'customer' THEN c.customer_name_en
+            WHEN cbvi.account_type = 'supplier' THEN s.supplier_name
+            WHEN cbvi.account_type = 'employee' THEN e.full_name
+            WHEN cbvi.account_type = 'general_ledger' THEN coa.account_title
+            ELSE NULL
+          END, ''),
+          cbvi.account_name_snapshot
+        ) AS account_name,
+        cbvi.description,
+        cbvi.receive,
+        cbvi.paid
+      FROM cash_book_voucher_items cbvi
+      LEFT JOIN customers c ON cbvi.account_type = 'customer' AND c.id = cbvi.account_id
+      LEFT JOIN suppliers s ON cbvi.account_type = 'supplier' AND s.id = cbvi.account_id
+      LEFT JOIN employees e ON cbvi.account_type = 'employee' AND e.id = cbvi.account_id
+      LEFT JOIN chart_of_accounts coa ON cbvi.account_type = 'general_ledger' AND coa.id = cbvi.account_id
+      WHERE cbvi.voucher_id = ?
+      ORDER BY cbvi.line_no ASC, cbvi.id ASC
     `,
     [voucherId]
   );
@@ -917,11 +920,7 @@ router.post("/accounts", async (req, res) => {
           coa.group_id,
           ag.group_name,
           coa.opening_balance,
-          CONCAT(
-            COALESCE(NULLIF(coa.account_code, ''), ''),
-            CASE WHEN coa.account_code IS NULL OR coa.account_code = '' THEN '' ELSE ' — ' END,
-            coa.account_title
-          ) AS display_name
+          coa.account_title AS display_name
         FROM chart_of_accounts coa
         LEFT JOIN account_groups ag
           ON ag.id = coa.group_id
@@ -1022,13 +1021,26 @@ router.get(
             cbv.updated_at,
             COUNT(cbvi.id) AS items_count,
             GROUP_CONCAT(
-              DISTINCT cbvi.account_name_snapshot
+              DISTINCT COALESCE(
+                NULLIF(CASE
+                  WHEN cbvi.account_type = 'customer' THEN c.customer_name_en
+                  WHEN cbvi.account_type = 'supplier' THEN s.supplier_name
+                  WHEN cbvi.account_type = 'employee' THEN e.full_name
+                  WHEN cbvi.account_type = 'general_ledger' THEN coa.account_title
+                  ELSE NULL
+                END, ''),
+                cbvi.account_name_snapshot
+              )
               ORDER BY cbvi.line_no
               SEPARATOR ', '
             ) AS account_names
           FROM cash_book_vouchers cbv
           LEFT JOIN cash_book_voucher_items cbvi
             ON cbvi.voucher_id = cbv.id
+          LEFT JOIN customers c ON cbvi.account_type = 'customer' AND c.id = cbvi.account_id
+          LEFT JOIN suppliers s ON cbvi.account_type = 'supplier' AND s.id = cbvi.account_id
+          LEFT JOIN employees e ON cbvi.account_type = 'employee' AND e.id = cbvi.account_id
+          LEFT JOIN chart_of_accounts coa ON cbvi.account_type = 'general_ledger' AND coa.id = cbvi.account_id
           ${whereSql}
           GROUP BY cbv.id
           ORDER BY cbv.voucher_date DESC, cbv.id DESC
