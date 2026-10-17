@@ -11,7 +11,7 @@ function ensureSchema() {
     id INT AUTO_INCREMENT PRIMARY KEY,
     group_name VARCHAR(180) NOT NULL,
     parent_group VARCHAR(180) NULL,
-    type VARCHAR(80) NOT NULL,
+    type VARCHAR(80) NOT NULL DEFAULT 'Other',
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
   ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`).catch(e => {ready=null; throw e;});
@@ -22,11 +22,10 @@ router.use(async (_req,res,next) => {try{await ensureSchema();next();}catch(e){r
 const valid = body => {
   const group_name = clean(body?.group_name);
   const parent_group = clean(body?.parent_group);
-  const type = clean(body?.type);
-  if (!group_name || !type) return {error:'Category name and account type are required.'};
-  if (group_name.length>180 || parent_group.length>180 || type.length>80) return {error:'Category details are too long.'};
+  if (!group_name) return {error:'Category name is required.'};
+  if (group_name.length>180 || parent_group.length>180) return {error:'Category details are too long.'};
   if (group_name.toLowerCase() === parent_group.toLowerCase()) return {error:'A category cannot be its own parent.'};
-  return {group_name,parent_group,type};
+  return {group_name,parent_group};
 };
 
 router.get('/', async (_req,res) => {
@@ -45,7 +44,7 @@ router.post('/', async (req,res) => {
   try {
     const v=valid(req.body);
     if(v.error)return res.status(400).json({error:v.error});
-    const r=await query('INSERT INTO account_groups (group_name,parent_group,type) VALUES (?,?,?)',[v.group_name,v.parent_group,v.type]);
+    const r=await query('INSERT INTO account_groups (group_name,parent_group,type) VALUES (?,?,?)',[v.group_name,v.parent_group,'Other']);
     res.status(201).json({message:'Chart of Accounts category created.',id:r.insertId});
   } catch(e){res.status(500).json({error:e.message});}
 });
@@ -55,7 +54,7 @@ router.put('/:id', async(req,res)=>{
     const v=valid(req.body);if(v.error)return res.status(400).json({error:v.error});
     const old=await query('SELECT group_name FROM account_groups WHERE id=? LIMIT 1',[id]);
     if(!old.length)return res.status(404).json({error:'Category not found.'});
-    await query('UPDATE account_groups SET group_name=?,parent_group=?,type=? WHERE id=?',[v.group_name,v.parent_group,v.type,id]);
+    await query('UPDATE account_groups SET group_name=?,parent_group=? WHERE id=?',[v.group_name,v.parent_group,id]);
     // Keep any subcategory parent-name references consistent.
     if(old[0].group_name !== v.group_name) {
       await query('UPDATE account_groups SET parent_group=? WHERE parent_group=?',[v.group_name,old[0].group_name]);
