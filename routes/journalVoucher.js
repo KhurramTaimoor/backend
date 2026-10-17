@@ -39,6 +39,11 @@ async function ensureSchema() {
     INDEX idx_jv_line_account (account_id),
     CONSTRAINT fk_jv_lines_header FOREIGN KEY (journal_voucher_id) REFERENCES journal_vouchers(id) ON DELETE CASCADE
   ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`);
+  // A durable counter keeps JV numbers unique, including after deleting a voucher.
+  await query(`CREATE TABLE IF NOT EXISTS journal_voucher_counters (
+    counter_key VARCHAR(20) PRIMARY KEY,
+    last_number BIGINT UNSIGNED NOT NULL DEFAULT 0
+  ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`);
 }
 router.use(async (_req, res, next) => {
   try { await ensureSchema(); next(); }
@@ -47,20 +52,48 @@ router.use(async (_req, res, next) => {
 
 // Each account type has its own ID namespace. Never join it to the wrong master table.
 const accountSources = {
-  customer: { table: "customers", label: "customer_name_en", code: "phone" },
-  supplier: { table: "suppliers", label: "supplier_name", code: "phone" },
-  employee: { table: "employees", label: "full_name", code: "phone" },
-  general: { table: "chart_of_accounts", label: "account_title", code: "account_code" },
+  customer: { table: "customers", label: "customer_name_en" },
+  supplier: { table: "suppliers", label: "supplier_name" },
+  employee: { table: "employees", label: "full_name" },
+  general: { table: "chart_of_accounts", label: "account_title" },
 };
 
 router.get("/accounts", async (_req, res) => {
   try {
     const entries = await Promise.all(Object.entries(accountSources).map(async ([account_type, source]) => {
-      const rows = await query(`SELECT id, ${source.label} AS account_title, ${source.code} AS account_code FROM ${source.table} ORDER BY ${source.label} ASC`);
-      return rows.map(row => ({ id: row.id, account_type, account_title: row.account_title, account_code: row.account_code || "" }));
+      const rows = await query(`SELECT id, ${source.label} AS account_title FROM ${source.table} ORDER BY ${source.label} ASC`);
+      return rows.map(row => ({ id: row.id, account_type, account_title: row.account_title || "" }));
     }));
     res.json(entries.flat());
   } catch (error) { res.status(500).json({ error: error.message || "Accounts could not be loaded" }); }
+});
+
+// Preview shows the next expected number. The final number is reserved atomically on save.
+const formatVoucherNo = (n) => `JV-${String(n).padStart(6, "0")}`;
+const findLegacyMaxNumber = async (execute = query) => {
+  const rows = await execute(`SELECT COALESCE(MAX(CAST(SUBSTRING(voucher_no, 4) AS UNSIGNED)), 0) AS max_number
+    FROM journal_vouchers WHERE voucher_no REGEXP '^JV-[0-9]+$'`);
+  return Number(rows[0]?.max_number || 0);
+};
+const getPreviewVoucherNo = async () => {
+  const [rows, legacyMax] = await Promise.all([
+    query("SELECT last_number FROM journal_voucher_counters WHERE counter_key = 'JV'"),
+    findLegacyMaxNumber(),
+  ]);
+  return formatVoucherNo(Math.max(Number(rows[0]?.last_number || 0), legacyMax) + 1);
+};
+async function reserveVoucherNo(execute) {
+  await execute(`INSERT INTO journal_voucher_counters (counter_key, last_number)
+    VALUES ('JV', 0) ON DUPLICATE KEY UPDATE last_number = last_number`);
+  const rows = await execute("SELECT last_number FROM journal_voucher_counters WHERE counter_key = 'JV' FOR UPDATE");
+  const legacyMax = await findLegacyMaxNumber(execute);
+  const next = Math.max(Number(rows[0]?.last_number || 0), legacyMax) + 1;
+  await execute("UPDATE journal_voucher_counters SET last_number = ? WHERE counter_key = 'JV'", [next]);
+  return formatVoucherNo(next);
+}
+router.get("/next-number", async (_req, res) => {
+  try { res.json({ voucher_no: await getPreviewVoucherNo() }); }
+  catch (error) { res.status(500).json({ error: error.message }); }
 });
 
 async function selectVoucher(id = null, filters = {}) {
@@ -152,7 +185,7 @@ router.get("/:id", async (req, res) => {
 function validate(body) {
   const voucherNo = text(body.voucher_no);
   const date = text(body.voucher_date || today());
-  if (!voucherNo || !isDate(date)) return { error: "Voucher no and a valid date are required." };
+  if (!isDate(date)) return { error: "A valid voucher date is required." };
   // Support old clients that still post the original two-account voucher shape.
   const sourceLines = Array.isArray(body.lines) && body.lines.length
     ? body.lines
@@ -228,9 +261,11 @@ router.post("/", async (req, res) => {
     const invalid = await validateAccounts(valid.lines);
     if (invalid) return res.status(400).json({ error: invalid });
     const id = await transaction(async execute => {
+      // Never trust the browser's preview: allocate the next number on this transaction.
+      const voucherNo = await reserveVoucherNo(execute);
       const result = await execute(`INSERT INTO journal_vouchers
         (voucher_no, voucher_date, account_dr_id, account_cr_id, amount, narration)
-        VALUES (?, ?, ?, ?, ?, ?)`, [valid.voucherNo, valid.date, firstGeneral(valid.lines, 'debit'), firstGeneral(valid.lines, 'credit'), valid.debit, valid.narration]);
+        VALUES (?, ?, ?, ?, ?, ?)`, [voucherNo, valid.date, firstGeneral(valid.lines, 'debit'), firstGeneral(valid.lines, 'credit'), valid.debit, valid.narration]);
       await storeLines(execute, result.insertId, valid.lines);
       return result.insertId;
     });
@@ -246,10 +281,11 @@ router.put("/:id", async (req, res) => {
     const invalid = await validateAccounts(valid.lines);
     if (invalid) return res.status(400).json({ error: invalid });
     await transaction(async execute => {
-      const existing = await execute("SELECT id FROM journal_vouchers WHERE id = ? FOR UPDATE", [id]);
+      const existing = await execute("SELECT id, voucher_no FROM journal_vouchers WHERE id = ? FOR UPDATE", [id]);
       if (!existing.length) { const err = new Error("Voucher not found"); err.status = 404; throw err; }
-      await execute(`UPDATE journal_vouchers SET voucher_no = ?, voucher_date = ?, account_dr_id = ?, account_cr_id = ?, amount = ?, narration = ? WHERE id = ?`,
-        [valid.voucherNo, valid.date, firstGeneral(valid.lines, 'debit'), firstGeneral(valid.lines, 'credit'), valid.debit, valid.narration, id]);
+      // Preserve the original voucher number when editing, including legacy vouchers.
+      await execute(`UPDATE journal_vouchers SET voucher_date = ?, account_dr_id = ?, account_cr_id = ?, amount = ?, narration = ? WHERE id = ?`,
+        [valid.date, firstGeneral(valid.lines, 'debit'), firstGeneral(valid.lines, 'credit'), valid.debit, valid.narration, id]);
       await execute("DELETE FROM journal_voucher_lines WHERE journal_voucher_id = ?", [id]);
       await storeLines(execute, id, valid.lines);
     });
