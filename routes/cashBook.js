@@ -1189,6 +1189,11 @@ router.put(
             );
           }
 
+          const chequeLink = await runQuery(connection,
+            'SELECT payment_id FROM cheque_cashbook_links WHERE cash_book_voucher_id = ? LIMIT 1',
+            [voucherId]);
+          if (chequeLink.length) throw httpError('Cheque clearing entry ko Cheque Voucher page se edit karein.', 409);
+
           const voucherDate =
             dateOnly(
               req.body.voucher_date ||
@@ -1327,6 +1332,11 @@ router.delete(
               404
             );
           }
+
+          const chequeLink = await runQuery(connection,
+            'SELECT payment_id FROM cheque_cashbook_links WHERE cash_book_voucher_id = ? LIMIT 1',
+            [voucherId]);
+          if (chequeLink.length) throw httpError('Cheque clearing entry ko Cheque Voucher page se delete karein.',409);
 
           await deleteVoucherItems(
             connection,
