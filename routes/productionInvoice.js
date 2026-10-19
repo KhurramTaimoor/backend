@@ -77,7 +77,7 @@ async function setup(){
     FROM products p LEFT JOIN product_types pt ON pt.id=p.product_type_id LEFT JOIN categories c ON c.id=p.category_id LEFT JOIN units u ON u.id=p.unit_id ORDER BY p.product_name`); }
   catch { products = await q(`SELECT id,product_name,product_type_id,category_id,unit_id FROM products ORDER BY product_name`).catch(()=>[]); }
 
-  const employees = await q(`SELECT e.id,e.full_name AS name,'employee' AS assignee_type,
+  const employees = await q(`SELECT e.id,e.full_name AS name,e.employee_type,'employee' AS assignee_type,
     COALESCE((SELECT er.per_day_salary FROM employee_rates er WHERE er.employee_id=e.id ORDER BY er.salary_month DESC,er.id DESC LIMIT 1), e.basic_salary/30, 0) AS default_rate
     FROM employees e ORDER BY e.full_name`).catch(()=>[]);
   const contractors = await q(`SELECT c.id,COALESCE(c.contractor_name,c.full_name,c.name,CONCAT('Contractor ',c.id)) AS name,'contractor' AS assignee_type,
