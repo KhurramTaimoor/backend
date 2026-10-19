@@ -148,6 +148,7 @@ const areaRoutes =
 
 const salesRateRoutes =
   require("./routes/rates");
+const scopedRateListRoutes = require("./routes/scopedRateLists");
 
 const saleOrderRoutes =
   require("./routes/saleOrder");
@@ -414,6 +415,7 @@ app.use(
   "/api/rates",
   salesRateRoutes
 );
+app.use("/api/scoped-rate-lists", scopedRateListRoutes);
 
 app.use(
   "/api/sale-orders",
