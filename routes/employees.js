@@ -29,6 +29,40 @@ const normalizeType = (value) => {
   return null;
 };
 
+// Keep existing employee schema and migrate only the optional photo column.
+let photoSchemaReady;
+const ensurePhotoColumn = () => {
+  if (!photoSchemaReady) {
+    photoSchemaReady = (async () => {
+      const cols = await query("SHOW COLUMNS FROM employees LIKE 'photo_data'");
+      if (!cols.length) {
+        try {
+          await query("ALTER TABLE employees ADD COLUMN photo_data MEDIUMTEXT NULL");
+        } catch (error) {
+          if (error.code !== "ER_DUP_FIELDNAME") throw error;
+        }
+      }
+    })().catch(error => { photoSchemaReady = null; throw error; });
+  }
+  return photoSchemaReady;
+};
+
+router.use(async (req, res, next) => {
+  try { await ensurePhotoColumn(); next(); }
+  catch (err) { return res.status(500).json({ success: false, message: "Employee picture storage could not be initialized.", error: err.message }); }
+});
+
+const validatePhoto = (value) => {
+  if (value === undefined || value === null || value === "") return null;
+  if (typeof value !== "string" || value.length > 750000 ||
+      !/^data:image\/(?:jpeg|png|webp);base64,[A-Za-z0-9+/]+={0,2}$/.test(value)) {
+    const err = new Error("Employee picture must be a valid JPG/PNG/WebP image (up to 550 KB after optimization).");
+    err.status = 400;
+    throw err;
+  }
+  return value;
+};
+
 const employeeSelect = `
   SELECT
     e.id,
@@ -39,6 +73,7 @@ const employeeSelect = `
     e.department_id,
     e.designation_id,
     e.joining_date,
+    e.photo_data,
     e.created_at,
     e.updated_at,
     d.department_name,
@@ -231,6 +266,20 @@ router.get("/", async (req, res) => {
 /*
   Department is added through the same /api/employees API.
 */
+router.get("/departments", async (_req, res) => {
+  try {
+    const departments = await query("SELECT id, department_name FROM departments ORDER BY department_name");
+    return res.json({ success: true, data: departments });
+  } catch (error) { return sendError(res, error, "Departments could not be loaded."); }
+});
+
+router.get("/designations", async (_req, res) => {
+  try {
+    const designations = await query("SELECT id, designation_name FROM designations WHERE status = 'Active' ORDER BY designation_name");
+    return res.json({ success: true, data: designations });
+  } catch (error) { return sendError(res, error, "Designations could not be loaded."); }
+});
+
 router.post("/departments", async (req, res) => {
   try {
     const departmentName = String(
@@ -340,6 +389,59 @@ router.post("/designations", async (req, res) => {
   }
 });
 
+// Department / Designation settings are independent from employee registration.
+router.put("/departments/:id", async (req, res) => {
+  try {
+    const id = Number(req.params.id);
+    const name = String(req.body.department_name || "").trim();
+    if (!Number.isInteger(id) || id <= 0 || !name || name.length > 180) return res.status(400).json({success:false, message:"Valid department name is required."});
+    const duplicate = await query("SELECT id FROM departments WHERE LOWER(department_name)=LOWER(?) AND id <> ? LIMIT 1",[name,id]);
+    if (duplicate.length) return res.status(409).json({success:false,message:"Department already exists."});
+    const result = await query("UPDATE departments SET department_name = ? WHERE id = ?",[name,id]);
+    if (!result.affectedRows) return res.status(404).json({success:false,message:"Department not found."});
+    return res.json({success:true,message:"Department updated."});
+  } catch(error){return sendError(res,error,"Department could not be updated.");}
+});
+
+router.delete("/departments/:id", async (req,res) => {
+  try {
+    const id = Number(req.params.id);
+    if (!Number.isInteger(id) || id <= 0) return res.status(400).json({success:false,message:"Invalid department ID."});
+    const used = await query("SELECT id FROM employees WHERE department_id = ? LIMIT 1",[id]);
+    if (used.length) return res.status(409).json({success:false,message:"This department is assigned to employees and cannot be deleted."});
+    const result = await query("DELETE FROM departments WHERE id = ?",[id]);
+    if (!result.affectedRows) return res.status(404).json({success:false,message:"Department not found."});
+    return res.json({success:true});
+  } catch(error){ if(error.code === 'ER_ROW_IS_REFERENCED_2'){error.status=409;error.message='Department is used by other records.';} return sendError(res,error,"Department could not be deleted."); }
+});
+
+router.put("/designations/:id", async (req, res) => {
+  try {
+    const id = Number(req.params.id);
+    const name = String(req.body.designation_name || "").trim();
+    if (!Number.isInteger(id) || id <= 0 || !name || name.length > 180) return res.status(400).json({success:false,message:"Valid designation name is required."});
+    const duplicate = await query("SELECT id FROM designations WHERE LOWER(designation_name)=LOWER(?) AND id <> ? LIMIT 1",[name,id]);
+    if (duplicate.length) return res.status(409).json({success:false,message:"Designation already exists."});
+    const result = await query("UPDATE designations SET designation_name = ? WHERE id = ?",[name,id]);
+    if (!result.affectedRows) return res.status(404).json({success:false,message:"Designation not found."});
+    // Legacy text column is retained by the app: keep it in sync with renamed designation.
+    await query("UPDATE employees SET designation = ? WHERE designation_id = ?",[name,id]);
+    return res.json({success:true,message:"Designation updated."});
+  } catch(error){return sendError(res,error,"Designation could not be updated.");}
+});
+
+router.delete("/designations/:id", async (req,res) => {
+  try {
+    const id = Number(req.params.id);
+    if (!Number.isInteger(id) || id <= 0) return res.status(400).json({success:false,message:"Invalid designation ID."});
+    const used = await query("SELECT id FROM employees WHERE designation_id = ? LIMIT 1",[id]);
+    if (used.length) return res.status(409).json({success:false,message:"This designation is assigned to employees and cannot be deleted."});
+    const result = await query("DELETE FROM designations WHERE id = ?",[id]);
+    if (!result.affectedRows) return res.status(404).json({success:false,message:"Designation not found."});
+    return res.json({success:true});
+  } catch(error){ if(error.code === 'ER_ROW_IS_REFERENCED_2'){error.status=409;error.message='Designation is used by other records.';} return sendError(res,error,"Designation could not be deleted."); }
+});
+
 router.get("/:id", async (req, res) => {
   try {
     const employee = await getEmployeeById(
@@ -376,6 +478,7 @@ router.post("/", async (req, res) => {
       department_id,
       designation_id,
       joining_date,
+      photo_data,
     } = req.body;
 
     const cleanName = String(
@@ -387,6 +490,7 @@ router.post("/", async (req, res) => {
     const cleanCnic = optionalText(cnic);
     const cleanType =
       normalizeType(employee_type);
+    const cleanPhoto = validatePhoto(photo_data);
 
     if (
       !cleanName ||
@@ -429,8 +533,9 @@ router.post("/", async (req, res) => {
         designation_id,
         designation,
         joining_date,
+        photo_data,
         basic_salary
-      ) VALUES (?, '', ?, ?, ?, ?, ?, ?, ?, 0)`,
+      ) VALUES (?, '', ?, ?, ?, ?, ?, ?, ?, ?, 0)`,
       [
         cleanName,
         cleanCnic,
@@ -440,6 +545,7 @@ router.post("/", async (req, res) => {
         Number(designation_id),
         designationName,
         joining_date || null,
+        cleanPhoto,
       ]
     );
 
@@ -483,6 +589,7 @@ router.put("/:id", async (req, res) => {
       department_id,
       designation_id,
       joining_date,
+      photo_data,
     } = req.body;
 
     const cleanName = String(
@@ -494,6 +601,7 @@ router.put("/:id", async (req, res) => {
     const cleanCnic = optionalText(cnic);
     const cleanType =
       normalizeType(employee_type);
+    const cleanPhoto = photo_data === undefined ? (existing.photo_data || null) : validatePhoto(photo_data);
 
     if (
       !cleanName ||
@@ -531,7 +639,8 @@ router.put("/:id", async (req, res) => {
         department_id = ?,
         designation_id = ?,
         designation = ?,
-        joining_date = ?
+        joining_date = ?,
+        photo_data = ?
        WHERE id = ?`,
       [
         cleanName,
@@ -542,6 +651,7 @@ router.put("/:id", async (req, res) => {
         Number(designation_id),
         designationName,
         joining_date || null,
+        cleanPhoto,
         employeeId,
       ]
     );
