@@ -41,7 +41,21 @@ router.get("/", async (req, res) => {
       "WHERE " + conditions.join(" AND "),
       "ORDER BY cb.entry_date ASC,cb.id ASC"
     ].join(" ");
-    const rows = await query(statement, params);
+    // Older databases can contain direct cash_book entries before voucher
+    // detail tables were introduced. Show those cash movements instead of 500.
+    const rows = await query(statement, params).catch(async (error) => {
+      if (error.code !== "ER_NO_SUCH_TABLE") throw error;
+      const legacyStatement = [
+        "SELECT cb.id,DATE_FORMAT(cb.entry_date,'%Y-%m-%d') AS entry_date,",
+        "COALESCE(cb.description,'') AS description,",
+        "'' AS account_type,NULL AS account_id,'' AS account_name,",
+        "'' AS voucher_no,COALESCE(cb.cash_in,0) AS cash_in,",
+        "COALESCE(cb.cash_out,0) AS cash_out",
+        "FROM cash_book cb WHERE " + conditions.join(" AND "),
+        "ORDER BY cb.entry_date ASC,cb.id ASC"
+      ].join(" ");
+      return query(legacyStatement, params);
+    });
     let balance = openingBalance, cashIn = 0, cashOut = 0;
     const data = rows.map(row => {
       const incoming = round(row.cash_in), outgoing = round(row.cash_out);
