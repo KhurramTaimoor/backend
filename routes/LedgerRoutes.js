@@ -1,6 +1,7 @@
 const express = require("express");
 const router = express.Router();
 const db = require("../db");
+const { chequeEntries } = require("./chequeLedgerEntries");
 
 function runQuery(sql, params = []) {
   return new Promise((resolve, reject) => {
@@ -387,6 +388,9 @@ router.get("/customer/:customerId/details", async (req, res) => {
     const allReturnTransactions = groupReturnTransactions(allReturnRows, invoiceMap);
     const allManualRows = await getManualLedgerEntries(customerId, "", "");
     const allManualTransactions = allManualRows.map(buildManualTransaction);
+    const allChequeTransactions = await chequeEntries('customer', customerId);
+    const chequeTransactions = allChequeTransactions.filter(transaction =>
+      isDateInRange(transaction.date, fromDate, toDate));
 
     const invoiceTransactions = allInvoiceTransactions.filter((transaction) =>
       isDateInRange(transaction.date, fromDate, toDate)
@@ -400,7 +404,7 @@ router.get("/customer/:customerId/details", async (req, res) => {
 
     const originalOpeningBalance = toNumber(customer.opening_balance);
     const broughtForwardMovement = fromDate
-      ? [...allInvoiceTransactions, ...allReturnTransactions, ...allManualTransactions]
+      ? [...allInvoiceTransactions, ...allReturnTransactions, ...allManualTransactions, ...allChequeTransactions]
           .filter((transaction) => isBeforeDate(transaction.date, fromDate))
           .reduce(
             (sum, transaction) =>
@@ -431,6 +435,7 @@ router.get("/customer/:customerId/details", async (req, res) => {
       ...invoiceTransactions,
       ...returnTransactions,
       ...manualTransactions,
+      ...chequeTransactions,
     ].sort((a, b) => {
       const dateCompare = cleanText(a.date).localeCompare(cleanText(b.date));
       if (dateCompare !== 0) return dateCompare;
@@ -513,145 +518,252 @@ router.get("/customer/:customerId/details", async (req, res) => {
   }
 });
 
-// Existing all-customer ledger endpoint retained for backward compatibility.
-router.get("/", async (req, res) => {
+// Customer ledger adjustments are saved in the EXISTING customer_ledger table.
+// No opening balance is overwritten; each entry is an additional movement.
+const crypto = require('crypto');
+const authMiddleware = require('../Middleware/authMiddleware');
+const ENTRY_TYPES = Object.freeze({
+  previous_due: { code: 'PD', label: 'Previous Due', side: 'debit' },
+  advance_received: { code: 'ADV', label: 'Advance Received', side: 'credit' },
+  payment_received: { code: 'PAY', label: 'Payment Received', side: 'credit' },
+  advance_refund: { code: 'REF', label: 'Advance Refunded', side: 'debit' },
+  debit_adjustment: { code: 'DADJ', label: 'Debit Adjustment', side: 'debit' },
+  credit_adjustment: { code: 'CADJ', label: 'Credit Adjustment', side: 'credit' },
+});
+
+const ENTRY_LABEL_BY_CODE = Object.fromEntries(
+  Object.values(ENTRY_TYPES).map(({ code, label }) => [code, label])
+);
+
+function isIsoDate(value) {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(String(value || ''))) return false;
+  const date = new Date(`${value}T00:00:00Z`);
+  return !Number.isNaN(date.getTime()) && date.toISOString().slice(0, 10) === value;
+}
+
+function manualVoucherType(ref) {
+  const code = /^GL-([A-Z]+)-/.exec(cleanText(ref))?.[1];
+  return ENTRY_LABEL_BY_CODE[code] || 'Manual Entry';
+}
+
+// POST /api/ledger/entries — signed-in users can add a customer debit/credit.
+// Always creates a new movement; it does NOT reset/edit the original opening balance.
+router.post('/entries', authMiddleware, async (req, res) => {
+  try {
+    const customerId = Number(req.body?.customer_id);
+    const entryDate = cleanText(req.body?.entry_date);
+    const kind = ENTRY_TYPES[cleanText(req.body?.entry_type)];
+    const rawAmount = req.body?.amount;
+    const amount = Number(rawAmount);
+    const description = cleanText(req.body?.description);
+
+    if (!Number.isSafeInteger(customerId) || customerId <= 0) {
+      return res.status(400).json({ success: false, message: 'Select a valid customer.' });
+    }
+    if (!kind) {
+      return res.status(400).json({ success: false, message: 'Select a valid entry type.' });
+    }
+    if (!isIsoDate(entryDate)) {
+      return res.status(400).json({ success: false, message: 'Enter a valid entry date (YYYY-MM-DD).' });
+    }
+    if (rawAmount === null || rawAmount === undefined || cleanText(rawAmount) === '' ||
+        !Number.isFinite(amount) || amount <= 0 || amount > 999999999999.99 ||
+        Math.abs(amount * 100 - Math.round(amount * 100)) > 0.0001) {
+      return res.status(400).json({ success: false, message: 'Amount must be positive and have up to two decimal places.' });
+    }
+    if (description.length > 500) {
+      return res.status(400).json({ success: false, message: 'Description must be 500 characters or less.' });
+    }
+
+    const customerRows = await runQuery('SELECT id, customer_name_en FROM customers WHERE id=? LIMIT 1', [customerId]);
+    if (!customerRows.length) {
+      return res.status(404).json({ success: false, message: 'Customer not found.' });
+    }
+
+    // Prefix retains the entry category in the existing reference_no column.
+    // Random reference is created once with the INSERT (no partial save/update).
+    const referenceNo = `GL-${kind.code}-${crypto.randomBytes(7).toString('hex').toUpperCase()}`;
+    const debit = kind.side === 'debit' ? amount : 0;
+    const credit = kind.side === 'credit' ? amount : 0;
+    const result = await runQuery(
+      `INSERT INTO customer_ledger
+         (customer_id, entry_date, reference_no, description_en, description, debit, credit)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      [customerId, entryDate, referenceNo, description || kind.label,
+        description || kind.label, debit, credit]
+    );
+
+    return res.status(201).json({
+      success: true,
+      message: 'Customer ledger entry saved.',
+      data: {
+        id: result.insertId,
+        customer_id: customerId,
+        customer_name: customerRows[0].customer_name_en,
+        entry_date: entryDate,
+        reference_no: referenceNo,
+        voucher_type: kind.label,
+        description: description || kind.label,
+        debit,
+        credit,
+      },
+    });
+  } catch (error) {
+    console.error('POST /api/ledger/entries:', error);
+    return res.status(500).json({ success: false, message: error.message || 'Unable to save ledger entry.' });
+  }
+});
+
+// Existing all-customer ledger report, now with customer_ledger entries and
+// correct opening/brought-forward balances within date ranges.
+router.get('/', async (req, res) => {
   try {
     const fromDate = cleanText(req.query.from_date);
     const toDate = cleanText(req.query.to_date);
+    const customerId = req.query.customer_id ? Number(req.query.customer_id) : null;
 
-    const invoiceWhere = [];
-    const invoiceParams = [];
-    const returnWhere = [];
-    const returnParams = [];
+    if ((fromDate && !isIsoDate(fromDate)) || (toDate && !isIsoDate(toDate)) ||
+        (fromDate && toDate && fromDate > toDate)) {
+      return res.status(400).json({ success: false, message: 'Invalid date range.' });
+    }
+    if (customerId !== null && (!Number.isSafeInteger(customerId) || customerId <= 0)) {
+      return res.status(400).json({ success: false, message: 'Invalid customer id.' });
+    }
 
-    addDateFilters({
-      alias: "si",
-      column: "invoice_date",
-      fromDate,
-      toDate,
-      where: invoiceWhere,
-      params: invoiceParams,
-    });
-    addDateFilters({
-      alias: "sr",
-      column: "return_date",
-      fromDate,
-      toDate,
-      where: returnWhere,
-      params: returnParams,
-    });
+    const customers = await runQuery(
+      `SELECT id, customer_name_en, COALESCE(opening_balance, 0) AS opening_balance FROM customers
+       ${customerId ? 'WHERE id = ?' : ''} ORDER BY id ASC`,
+      customerId ? [customerId] : []
+    );
+    const customerMap = new Map(customers.map(c => [Number(c.id), c]));
 
-    const invoiceWhereSql = invoiceWhere.length ? `WHERE ${invoiceWhere.join(" AND ")}` : "";
-    const returnWhereSql = returnWhere.length ? `WHERE ${returnWhere.join(" AND ")}` : "";
-
-    const invoices = await runQuery(
-      `SELECT
-         CONCAT('INV-', si.id) AS id,
-         DATE_FORMAT(si.invoice_date, '%Y-%m-%d') AS date,
-         COALESCE(si.customer_id, CASE WHEN si.party_type = 'customer' THEN si.party_id END) AS customer_id,
-         COALESCE(c.customer_name_en, si.party_name, si.customer_name_en, '—') AS customer_name,
+    const invoiceRows = await runQuery(
+      `SELECT CONCAT('INV-',si.id) AS id,
+         DATE_FORMAT(si.invoice_date,'%Y-%m-%d') AS date,
+         COALESCE(si.customer_id, CASE WHEN si.party_type='customer' THEN si.party_id END) AS customer_id,
          'Sale Invoice' AS voucher_type,
-         CONCAT('Sale Invoice - ', si.invoice_no) AS description,
+         CONCAT('Sale Invoice - ',COALESCE(si.invoice_no,'')) AS description,
          si.invoice_no AS ref,
-         COALESCE(c.opening_balance, 0) AS opening_balance,
-         GREATEST(
-           COALESCE(si.invoice_total, si.total_amount, 0)
-           + COALESCE(si.delivery_charges, 0)
-           - COALESCE(si.discount, 0),
-           0
-         ) AS debit,
-         0 AS credit,
-         2 AS sort_order
+         GREATEST(COALESCE(si.invoice_total,si.total_amount,0) +
+           COALESCE(si.delivery_charges,0) - COALESCE(si.discount,0),0) AS debit,
+         0 AS credit, 2 AS sort_order
        FROM sales_invoices si
-       LEFT JOIN customers c
-         ON c.id = COALESCE(si.customer_id, CASE WHEN si.party_type = 'customer' THEN si.party_id END)
-       ${invoiceWhereSql}
-       ORDER BY si.invoice_date ASC, si.id ASC`,
-      invoiceParams
+       ${customerId ? "WHERE COALESCE(si.customer_id,CASE WHEN si.party_type='customer' THEN si.party_id END)=?" : ''}
+       ORDER BY si.invoice_date,si.id`, customerId ? [customerId] : []
     );
 
-    const returns = await runQuery(
-      `SELECT
-         CONCAT('RET-', sr.id) AS id,
-         DATE_FORMAT(sr.return_date, '%Y-%m-%d') AS date,
+    const returnRows = await runQuery(
+      `SELECT CONCAT('RET-',sr.id) AS id,
+         DATE_FORMAT(sr.return_date,'%Y-%m-%d') AS date,
          COALESCE(sr.party_id, si.customer_id) AS customer_id,
-         COALESCE(c.customer_name_en, sr.party_name, sr.customer_name, '—') AS customer_name,
          'Sale Return' AS voucher_type,
-         CONCAT('Sale Return - ', sr.return_no) AS description,
-         sr.return_no AS ref,
-         0 AS opening_balance,
-         0 AS debit,
-         COALESCE(sr.return_amount, 0) AS credit,
-         3 AS sort_order
+         CONCAT('Sale Return - ',COALESCE(sr.return_no,'')) AS description,
+         sr.return_no AS ref, 0 AS debit,
+         COALESCE(sr.return_amount,0) AS credit, 3 AS sort_order
        FROM sales_returns sr
        LEFT JOIN sales_invoices si
-         ON si.id = sr.invoice_id OR si.invoice_no = sr.invoice_ref
-       LEFT JOIN customers c
-         ON c.id = COALESCE(sr.party_id, si.customer_id)
-       ${returnWhereSql}
-       ORDER BY sr.return_date ASC, sr.id ASC`,
-      returnParams
+         ON (sr.invoice_id IS NOT NULL AND si.id=sr.invoice_id)
+         OR (sr.invoice_id IS NULL AND si.invoice_no=sr.invoice_ref)
+       ${customerId ? 'WHERE COALESCE(sr.party_id,si.customer_id)=?' : ''}
+       ORDER BY sr.return_date,sr.id`, customerId ? [customerId] : []
     );
 
-    const customerOpeningMap = new Map();
-    [...invoices, ...returns].forEach((row) => {
-      const customerId = Number(row.customer_id) || 0;
-      if (!customerId || customerOpeningMap.has(customerId)) return;
-      const opening = toNumber(row.opening_balance);
-      customerOpeningMap.set(customerId, {
-        id: `OB-${customerId}`,
-        date: fromDate || "",
-        customer_id: customerId,
-        customer_name: row.customer_name || "—",
-        voucher_type: "Opening Balance",
-        description: "Opening balance carried forward",
-        ref: "OB",
-        opening_balance: opening,
-        debit: opening > 0 ? opening : 0,
-        credit: opening < 0 ? Math.abs(opening) : 0,
-        sort_order: 1,
-      });
-    });
+    let manualRows = [];
+    try {
+      manualRows = await runQuery(
+        `SELECT CONCAT('LED-',cl.id) AS id,
+           DATE_FORMAT(cl.entry_date,'%Y-%m-%d') AS date,
+           cl.customer_id, cl.description_en, cl.description, cl.reference_no,
+           COALESCE(cl.debit,0) AS debit, COALESCE(cl.credit,0) AS credit,
+           4 AS sort_order
+         FROM customer_ledger cl ${customerId ? 'WHERE cl.customer_id=?' : ''}
+         ORDER BY cl.entry_date,cl.id`, customerId ? [customerId] : []
+      );
+    } catch (error) {
+      if (error.code !== 'ER_NO_SUCH_TABLE' && error.errno !== 1146) throw error;
+    }
 
-    const combined = [
-      ...Array.from(customerOpeningMap.values()),
-      ...invoices,
-      ...returns,
-    ].sort((a, b) => {
-      if (Number(a.customer_id) !== Number(b.customer_id)) {
-        return Number(a.customer_id) - Number(b.customer_id);
+    const allCheques = await runQuery(`SELECT cv.id, cv.account_id AS customer_id,
+      DATE_FORMAT(cv.issuance_date, '%Y-%m-%d') AS date,
+      cv.voucher_no AS ref, cv.payee_name,
+      cv.cheque_direction, cv.total_amount
+      FROM cheque_vouchers cv WHERE cv.account_type = 'customer'
+      ${customerId ? 'AND cv.account_id = ?' : ''}
+      ORDER BY cv.issuance_date, cv.id`, customerId ? [customerId] : []);
+    const chequeRows = allCheques.map(c => ({
+      id: `CHQ-${c.id}`, customer_id: c.customer_id, date: c.date,
+      voucher_type: c.cheque_direction === 'receive' ? 'Cheque Received' : 'Cheque Issued',
+      description: `${c.cheque_direction === 'receive' ? 'Cheque Received' : 'Cheque Issued'} - ${c.payee_name || ''}`,
+      ref: c.ref, debit: c.cheque_direction === 'receive' ? 0 : toNumber(c.total_amount),
+      credit: c.cheque_direction === 'receive' ? toNumber(c.total_amount) : 0, sort_order: 5,
+    }));
+    const transactions = [...invoiceRows, ...returnRows, ...chequeRows, ...manualRows.map(r => ({
+      id: r.id,
+      date: r.date,
+      customer_id: r.customer_id,
+      voucher_type: manualVoucherType(r.reference_no),
+      description: cleanText(r.description_en || r.description) || 'Ledger Entry',
+      ref: r.reference_no || r.id,
+      debit: r.debit,
+      credit: r.credit,
+      sort_order: r.sort_order,
+    }))].filter(row => customerMap.has(Number(row.customer_id)));
+
+    const byCustomer = new Map();
+    for (const row of transactions) {
+      const key = Number(row.customer_id);
+      if (!byCustomer.has(key)) byCustomer.set(key, []);
+      byCustomer.get(key).push(row);
+    }
+
+    const output = [];
+    for (const customer of customers) {
+      const customerKey = Number(customer.id);
+      const rows = byCustomer.get(customerKey) || [];
+      rows.sort((a, b) => cleanText(a.date).localeCompare(cleanText(b.date)) ||
+        (a.sort_order - b.sort_order) || cleanText(a.ref).localeCompare(cleanText(b.ref)));
+
+      // Opening is the customer's signed initial balance PLUS all activity before
+      // the report's starting date (otherwise filtering loses previous payments).
+      let opening = toNumber(customer.opening_balance);
+      if (fromDate) {
+        for (const row of rows) {
+          if (row.date && row.date < fromDate) opening += toNumber(row.debit) - toNumber(row.credit);
+        }
       }
-      const dateCompare = cleanText(a.date).localeCompare(cleanText(b.date));
-      if (dateCompare !== 0) return dateCompare;
-      if (a.sort_order !== b.sort_order) return a.sort_order - b.sort_order;
-      return cleanText(a.ref).localeCompare(cleanText(b.ref));
-    });
+      const period = rows.filter(row => (!fromDate || (row.date && row.date >= fromDate)) &&
+        (!toDate || (row.date && row.date <= toDate)));
+      if (!period.length && opening === 0 && !customerId) continue;
 
-    const balanceByCustomer = new Map();
-    const ledger = combined.map((row) => {
-      const customerId = Number(row.customer_id) || 0;
-      const current = toNumber(balanceByCustomer.get(customerId));
-      const balance = current + toNumber(row.debit) - toNumber(row.credit);
-      balanceByCustomer.set(customerId, balance);
-      return {
-        ...row,
-        debit: toNumber(row.debit),
-        credit: toNumber(row.credit),
-        balance,
-      };
-    });
+      output.push({
+        id: `OB-${customerKey}`, date: fromDate || '',
+        customer_id: customerKey, customer_name: customer.customer_name_en || '—',
+        voucher_type: 'Opening Balance',
+        description: fromDate ? 'Balance Brought Forward' : 'Opening balance carried forward',
+        ref: 'OB',
+        debit: opening > 0 ? opening : 0,
+        credit: opening < 0 ? -opening : 0,
+        opening_balance: opening,
+        sort_order: 1,
+        balance: opening,
+      });
 
-    return res.json({
-      success: true,
-      message: "Ledger fetched successfully.",
-      data: ledger,
-    });
+      let balance = opening;
+      for (const row of period) {
+        balance += toNumber(row.debit) - toNumber(row.credit);
+        output.push({
+          ...row,
+          customer_id: customerKey, customer_name: customer.customer_name_en || '—',
+          debit: toNumber(row.debit), credit: toNumber(row.credit),
+          balance,
+        });
+      }
+    }
+
+    return res.json({ success: true, message: 'Ledger fetched successfully.', data: output });
   } catch (error) {
-    console.error("GET /api/ledger:", error);
-    return res.status(500).json({
-      success: false,
-      message: error.message || "Failed to load ledger.",
-    });
+    console.error('GET /api/ledger:', error);
+    return res.status(500).json({ success: false, message: error.message || 'Failed to load ledger.' });
   }
 });
 

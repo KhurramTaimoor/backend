@@ -1,6 +1,7 @@
 const express = require("express");
 const router = express.Router();
 const db = require("../db");
+const { chequeEntries } = require("./chequeLedgerEntries");
 
 /*
  * Supplier Detail Ledger
@@ -642,6 +643,9 @@ async function buildDetailedLedger(
   );
   const allManualTransactions =
     allManualRows.map(buildManualTransaction);
+  const allChequeTransactions = await chequeEntries('supplier', supplierId);
+  const chequeTransactions = allChequeTransactions.filter(transaction =>
+    isDateInRange(transaction.date, fromDate, toDate));
 
   const invoiceTransactions = allInvoiceTransactions.filter(
     (transaction) =>
@@ -667,6 +671,7 @@ async function buildDetailedLedger(
         ...allInvoiceTransactions,
         ...allReturnTransactions,
         ...allManualTransactions,
+        ...allChequeTransactions,
       ]
         .filter((transaction) =>
           isBeforeDate(transaction.date, fromDate)
@@ -707,6 +712,7 @@ async function buildDetailedLedger(
     ...invoiceTransactions,
     ...returnTransactions,
     ...manualTransactions,
+    ...chequeTransactions,
   ].sort((a, b) => {
     const dateCompare = cleanText(a.date).localeCompare(
       cleanText(b.date)

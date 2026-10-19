@@ -1,6 +1,7 @@
 const express = require("express");
 const router = express.Router();
 const db = require("../db");
+const { chequeEntries } = require("./chequeLedgerEntries");
 
 router.get("/employees", (req, res) => {
   db.query("SELECT id, full_name FROM employees ORDER BY full_name", (err, r) => {
@@ -25,11 +26,16 @@ router.get("/", (req, res) => {
     WHERE p.employee_id = ?
     ORDER BY p.year DESC, p.month DESC`;
 
-  db.query(sql, [employee_id], (err, r) => {
+  db.query(sql, [employee_id], async (err, r) => {
     if (err) return res.status(500).json({ error: err.message });
     const total_paid = r.filter(x => x.status === "paid").reduce((s, x) => s + Number(x.net_salary), 0);
     const total_due  = r.filter(x => x.status !== "paid").reduce((s, x) => s + Number(x.net_salary), 0);
+    let cheque_transactions = [];
+    try { cheque_transactions = await chequeEntries('employee', Number(employee_id)); }
+    catch(error) { return res.status(500).json({error:error.message}); }
     res.json({
+      cheque_transactions,
+      cheque_balance_change: cheque_transactions.reduce((sum, tx) => sum + tx.debit - tx.credit, 0),
       employee: r[0] ? { name: r[0].employee_name, department: r[0].department_name } : {},
       records: r,
       total_paid,

@@ -38,6 +38,80 @@ const httpError = (message, status = 400) => {
   return error;
 };
 
+
+const ACCOUNT_TYPES = {
+  customer: { table: "customers", name: "customer_name_en" },
+  supplier: { table: "suppliers", name: "supplier_name" },
+  employee: { table: "employees", name: "full_name" },
+  general_ledger: { table: "chart_of_accounts", name: "account_title" },
+};
+const normalizeType = (value) => {
+  const key = cleanText(value).toLowerCase().replace(/\s+/g, "_");
+  return ({ general: "general_ledger", general_account: "general_ledger", ledger: "general_ledger",
+    customers: "customer", suppliers: "supplier", employees: "employee" })[key] || key;
+};
+const normalizeDirection = (v) => cleanText(v).toLowerCase() === "receive" ? "receive" : "issue";
+
+const getAccount = async (connection, type, id) => {
+  const item = ACCOUNT_TYPES[type];
+  if (!item) throw httpError("Customer, Supplier, Employee ya General Account select karein.");
+  const rows = await runQuery(connection,
+    `SELECT id, \`${item.name}\` AS name FROM \`${item.table}\` WHERE id = ? LIMIT 1`, [id]);
+  if (!rows.length) throw httpError("Selected account nahi mila.", 404);
+  return { id: Number(rows[0].id), name: cleanText(rows[0].name) };
+};
+
+// A cleared instalment creates a real Cash Book voucher/line on the clearance date.
+// Link is unique by cheque payment id. The cheque's face value is posted separately
+// to the party ledger on the cheque issuance/receipt date; Cash Book is settlement.
+async function syncCashbookPayments(connection, chequeId, voucherNo, accountType, accountId, accountName, direction, payments) {
+  for (const payment of payments) {
+    const no = `CHQ-${chequeId}-CLR-${payment.id}`;
+    const receive = direction === "receive" ? payment.amount : 0;
+    const paid = direction === "issue" ? payment.amount : 0;
+    const description = `Cheque ${voucherNo} | ${payment.details}`.slice(0, 500);
+    const voucher = await runQuery(connection,
+      `INSERT INTO cash_book_vouchers (voucher_no, voucher_date, notes, total_receive, total_paid)
+       VALUES (?, ?, ?, ?, ?)`, [no, payment.payment_date, `Cheque clearing - ${voucherNo}`, receive, paid]);
+    const item = await runQuery(connection,
+      `INSERT INTO cash_book_voucher_items
+       (voucher_id,line_no,account_type,account_id,account_name_snapshot,description,receive,paid,legacy_cash_book_id)
+       VALUES (?, 1, ?, ?, ?, ?, ?, ?, NULL)`,
+      [voucher.insertId, accountType, accountId, accountName, description, receive, paid]);
+    const legacy = await runQuery(connection,
+      `INSERT INTO cash_book (entry_date,description,cash_in,cash_out,balance) VALUES (?, ?, ?, ?, 0)`,
+      [payment.payment_date, `${no} | ${description}`, receive, paid]);
+    await runQuery(connection, `UPDATE cash_book_voucher_items SET legacy_cash_book_id = ? WHERE id = ?`,
+      [legacy.insertId,item.insertId]);
+    await runQuery(connection,
+      `INSERT INTO cheque_cashbook_links (payment_id,cheque_voucher_id,cash_book_voucher_id,cash_book_item_id,legacy_cash_book_id)
+       VALUES (?, ?, ?, ?, ?)`, [payment.id, chequeId, voucher.insertId, item.insertId, legacy.insertId]);
+  }
+  if (payments.length) await recalcCashbookBalances(connection);
+}
+async function recalcCashbookBalances(connection) {
+  const rows = await runQuery(connection,
+    'SELECT id,cash_in,cash_out FROM cash_book ORDER BY entry_date ASC,id ASC');
+  let balance = 0;
+  for (const row of rows) {
+    balance = toAmount(balance + toAmount(row.cash_in) - toAmount(row.cash_out));
+    await runQuery(connection,'UPDATE cash_book SET balance = ? WHERE id = ?', [balance,row.id]);
+  }
+}
+async function unlinkCashbookPayments(connection, chequeId) {
+  const links = await runQuery(connection,
+    `SELECT payment_id,cash_book_voucher_id,legacy_cash_book_id FROM cheque_cashbook_links
+     WHERE cheque_voucher_id = ? FOR UPDATE`, [chequeId]);
+  if (!links.length) return;
+  const voucherIds = links.map(r => Number(r.cash_book_voucher_id));
+  const legacyIds = links.map(r => Number(r.legacy_cash_book_id)).filter(Boolean);
+  await runQuery(connection, 'DELETE FROM cheque_cashbook_links WHERE cheque_voucher_id = ?', [chequeId]);
+  await runQuery(connection, 'DELETE FROM cash_book_voucher_items WHERE voucher_id IN (?)', [voucherIds]);
+  await runQuery(connection, 'DELETE FROM cash_book_vouchers WHERE id IN (?)', [voucherIds]);
+  if (legacyIds.length) await runQuery(connection, 'DELETE FROM cash_book WHERE id IN (?)',[legacyIds]);
+  await recalcCashbookBalances(connection);
+}
+
 const schemaReady = (async () => {
   await runQuery(
     db,
@@ -73,11 +147,27 @@ const schemaReady = (async () => {
         ON DELETE CASCADE
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`
   );
+
+  const columns = new Set((await runQuery(db,'SHOW COLUMNS FROM cheque_vouchers')).map(r => r.Field));
+  if (!columns.has('account_type')) {
+    await runQuery(db, "ALTER TABLE cheque_vouchers ADD COLUMN account_type VARCHAR(40) NOT NULL DEFAULT 'general_ledger'");
+  }
+  if (!columns.has('cheque_direction')) {
+    await runQuery(db, "ALTER TABLE cheque_vouchers ADD COLUMN cheque_direction VARCHAR(12) NOT NULL DEFAULT 'issue'");
+  }
+  await runQuery(db, `CREATE TABLE IF NOT EXISTS cheque_cashbook_links (
+    payment_id INT NOT NULL PRIMARY KEY,
+    cheque_voucher_id INT NOT NULL,
+    cash_book_voucher_id INT NOT NULL UNIQUE,
+    cash_book_item_id INT NOT NULL UNIQUE,
+    legacy_cash_book_id INT NOT NULL UNIQUE,
+    INDEX idx_cheque_link (cheque_voucher_id)
+  ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`);
 })().catch((error) => {
   // Do not crash the whole API when MySQL is temporarily unavailable.
   // Individual requests will still return a normal 500 until the DB is reachable.
   console.error("Cheque voucher schema initialization failed:", error.message);
-  return false;
+  throw error;
 });
 
 const voucherSelect = `
@@ -86,8 +176,10 @@ const voucherSelect = `
     cv.voucher_no,
     cv.payee_name,
     cv.account_id,
-    coa.account_code,
-    coa.account_title,
+    cv.account_type,
+    cv.cheque_direction,
+    COALESCE(cu.customer_name_en, su.supplier_name, em.full_name, coa.account_title, cv.payee_name) AS account_title,
+    CASE WHEN cv.account_type = 'general_ledger' THEN coa.account_code ELSE NULL END AS account_code,
     DATE_FORMAT(cv.issuance_date, '%Y-%m-%d') AS issuance_date,
     DATE_FORMAT(cv.clearance_date, '%Y-%m-%d') AS clearance_date,
     cv.total_amount,
@@ -102,14 +194,18 @@ const voucherSelect = `
       ELSE 'pending'
     END AS status
   FROM cheque_vouchers cv
-  LEFT JOIN chart_of_accounts coa ON coa.id = cv.account_id
+  LEFT JOIN chart_of_accounts coa ON cv.account_type = 'general_ledger' AND coa.id = cv.account_id
+  LEFT JOIN customers cu ON cv.account_type = 'customer' AND cu.id = cv.account_id
+  LEFT JOIN suppliers su ON cv.account_type = 'supplier' AND su.id = cv.account_id
+  LEFT JOIN employees em ON cv.account_type = 'employee' AND em.id = cv.account_id
   LEFT JOIN cheque_voucher_payments cvp ON cvp.cheque_voucher_id = cv.id
 `;
 
 const voucherGroupBy = `
   GROUP BY
     cv.id, cv.voucher_no, cv.payee_name, cv.account_id,
-    coa.account_code, coa.account_title, cv.issuance_date,
+    cv.account_type, cv.cheque_direction, coa.account_code, coa.account_title,
+    cu.customer_name_en, su.supplier_name, em.full_name, cv.issuance_date,
     cv.clearance_date, cv.total_amount, cv.notes,
     cv.created_at, cv.updated_at
 `;
@@ -135,15 +231,19 @@ async function loadVoucher(id, executor = db) {
   const payments = await runQuery(
     executor,
     `SELECT
-       id,
-       cheque_voucher_id,
-       DATE_FORMAT(payment_date, '%Y-%m-%d') AS payment_date,
-       details,
-       amount,
-       created_at
-     FROM cheque_voucher_payments
-     WHERE cheque_voucher_id = ?
-     ORDER BY payment_date ASC, id ASC`,
+       cvp.id,
+       cvp.cheque_voucher_id,
+       DATE_FORMAT(cvp.payment_date, '%Y-%m-%d') AS payment_date,
+       cvp.details,
+       cvp.amount,
+       cvp.created_at,
+       cbv.voucher_no AS cash_book_voucher_no,
+       cbl.cash_book_voucher_id
+     FROM cheque_voucher_payments cvp
+     LEFT JOIN cheque_cashbook_links cbl ON cbl.payment_id = cvp.id
+     LEFT JOIN cash_book_vouchers cbv ON cbv.id = cbl.cash_book_voucher_id
+     WHERE cvp.cheque_voucher_id = ?
+     ORDER BY cvp.payment_date ASC, cvp.id ASC`,
     [id]
   );
 
@@ -164,6 +264,9 @@ function normalizePayload(body = {}) {
   const totalAmount = toAmount(body.total_amount);
   const accountId = toId(body.account_id);
   const payeeName = cleanText(body.payee_name);
+  const accountType = normalizeType(body.account_type || 'general_ledger');
+  if (!ACCOUNT_TYPES[accountType]) throw httpError('Invalid account type.');
+  const direction = normalizeDirection(body.cheque_direction);
 
   if (!payeeName) throw httpError("Payee / party name zaroori hai.");
   if (!accountId) throw httpError("Ledger account select karein.");
@@ -180,7 +283,7 @@ function normalizePayload(body = {}) {
       details: cleanText(payment.details),
       amount: toAmount(payment.amount),
     }))
-    .filter((payment) => payment.payment_date || payment.details || payment.amount);
+    .filter((payment) => payment.details || payment.amount);
 
   payments.forEach((payment, index) => {
     if (!payment.payment_date) {
@@ -191,6 +294,9 @@ function normalizePayload(body = {}) {
     }
     if (payment.amount <= 0) {
       throw httpError(`Payment row ${index + 1}: amount zero se zyada hona chahiye.`);
+    }
+    if (payment.payment_date < issuanceDate) {
+      throw httpError(`Clearing row ${index + 1} ki date cheque date se pehle nahi ho sakti.`);
     }
   });
 
@@ -205,6 +311,8 @@ function normalizePayload(body = {}) {
     voucher_no: cleanText(body.voucher_no),
     payee_name: payeeName,
     account_id: accountId,
+    account_type: accountType,
+    cheque_direction: direction,
     issuance_date: issuanceDate,
     clearance_date: clearanceDate,
     total_amount: totalAmount,
@@ -213,25 +321,23 @@ function normalizePayload(body = {}) {
   };
 }
 
-async function assertAccount(accountId, executor = db) {
-  const rows = await runQuery(
-    executor,
-    "SELECT id FROM chart_of_accounts WHERE id = ? LIMIT 1",
-    [accountId]
-  );
-  if (!rows.length) throw httpError("Selected ledger account nahi mila.", 404);
+async function assertAccount(accountType, accountId, executor = db) {
+  return getAccount(executor, accountType, accountId);
 }
 
 async function insertPayments(executor, voucherId, payments) {
+  const inserted = [];
   for (const payment of payments) {
-    await runQuery(
+    const result = await runQuery(
       executor,
       `INSERT INTO cheque_voucher_payments
        (cheque_voucher_id, payment_date, details, amount)
        VALUES (?, ?, ?, ?)`,
       [voucherId, payment.payment_date, payment.details, payment.amount]
     );
+    inserted.push({ ...payment, id: result.insertId });
   }
+  return inserted;
 }
 
 function sendError(res, error, label) {
@@ -244,6 +350,19 @@ function sendError(res, error, label) {
       : error.message || "Cheque voucher request failed.",
   });
 }
+
+router.get('/lookups', async (_req, res) => {
+  try {
+    await schemaReady;
+    const data = {};
+    for (const [type, config] of Object.entries(ACCOUNT_TYPES)) {
+      const records = await runQuery(db,
+        `SELECT id, \`${config.name}\` AS name FROM \`${config.table}\` ORDER BY \`${config.name}\` ASC`);
+      data[type] = records.map(row => ({ id: Number(row.id), name: cleanText(row.name) }));
+    }
+    return res.json({success:true,data});
+  } catch(error) {return sendError(res,error,'GET /cheque-vouchers/lookups:');}
+});
 
 router.get("/dashboard", async (req, res) => {
   try {
@@ -286,10 +405,11 @@ router.get("/", async (req, res) => {
 
     if (search) {
       conditions.push(
-        "(cv.voucher_no LIKE ? OR cv.payee_name LIKE ? OR coa.account_title LIKE ?)"
+        `(cv.voucher_no LIKE ? OR cv.payee_name LIKE ? OR coa.account_title LIKE ? OR cu.customer_name_en LIKE ?
+          OR su.supplier_name LIKE ? OR em.full_name LIKE ?)`
       );
       const needle = `%${search}%`;
-      params.push(needle, needle, needle);
+      params.push(needle, needle, needle, needle, needle, needle);
     }
 
     const where = conditions.length ? `WHERE ${conditions.join(" AND ")}` : "";
@@ -345,7 +465,7 @@ router.post("/", async (req, res) => {
     const payload = normalizePayload(req.body);
     connection = await getConnection();
     await runQuery(connection, "START TRANSACTION");
-    await assertAccount(payload.account_id, connection);
+    const account = await assertAccount(payload.account_type, payload.account_id, connection);
 
     let voucherNo = payload.voucher_no;
     if (!voucherNo) {
@@ -359,12 +479,14 @@ router.post("/", async (req, res) => {
     const result = await runQuery(
       connection,
       `INSERT INTO cheque_vouchers
-       (voucher_no, payee_name, account_id, issuance_date, clearance_date, total_amount, notes)
-       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+       (voucher_no, payee_name, account_id, account_type, cheque_direction, issuance_date, clearance_date, total_amount, notes)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         voucherNo,
         payload.payee_name,
         payload.account_id,
+        payload.account_type,
+        payload.cheque_direction,
         payload.issuance_date,
         payload.clearance_date,
         payload.total_amount,
@@ -372,7 +494,9 @@ router.post("/", async (req, res) => {
       ]
     );
 
-    await insertPayments(connection, result.insertId, payload.payments);
+    const payments = await insertPayments(connection, result.insertId, payload.payments);
+    await syncCashbookPayments(connection, result.insertId, voucherNo, payload.account_type,
+      payload.account_id, account.name, payload.cheque_direction, payments);
     await runQuery(connection, "COMMIT");
     const voucher = await loadVoucher(result.insertId);
     return res.status(201).json({
@@ -399,7 +523,7 @@ router.put("/:id", async (req, res) => {
 
     connection = await getConnection();
     await runQuery(connection, "START TRANSACTION");
-    await assertAccount(payload.account_id, connection);
+    const account = await assertAccount(payload.account_type, payload.account_id, connection);
 
     const current = await runQuery(
       connection,
@@ -411,13 +535,15 @@ router.put("/:id", async (req, res) => {
     await runQuery(
       connection,
       `UPDATE cheque_vouchers SET
-         voucher_no = ?, payee_name = ?, account_id = ?, issuance_date = ?,
+         voucher_no = ?, payee_name = ?, account_id = ?, account_type = ?, cheque_direction = ?, issuance_date = ?,
          clearance_date = ?, total_amount = ?, notes = ?
        WHERE id = ?`,
       [
         payload.voucher_no || current[0].voucher_no,
         payload.payee_name,
         payload.account_id,
+        payload.account_type,
+        payload.cheque_direction,
         payload.issuance_date,
         payload.clearance_date,
         payload.total_amount,
@@ -425,12 +551,15 @@ router.put("/:id", async (req, res) => {
         id,
       ]
     );
+    await unlinkCashbookPayments(connection, id);
     await runQuery(
       connection,
       "DELETE FROM cheque_voucher_payments WHERE cheque_voucher_id = ?",
       [id]
     );
-    await insertPayments(connection, id, payload.payments);
+    const payments = await insertPayments(connection, id, payload.payments);
+    await syncCashbookPayments(connection, id, payload.voucher_no || current[0].voucher_no,
+      payload.account_type, payload.account_id, account.name, payload.cheque_direction, payments);
     await runQuery(connection, "COMMIT");
 
     const voucher = await loadVoucher(id);
@@ -449,16 +578,24 @@ router.put("/:id", async (req, res) => {
 });
 
 router.delete("/:id", async (req, res) => {
+  let connection;
   try {
     await schemaReady;
     const id = toId(req.params.id);
     if (!id) throw httpError("Valid cheque voucher id zaroori hai.");
-    const result = await runQuery(db, "DELETE FROM cheque_vouchers WHERE id = ?", [id]);
-    if (!result.affectedRows) throw httpError("Cheque voucher nahi mila.", 404);
-    return res.json({ success: true, message: "Cheque voucher delete ho gaya." });
-  } catch (error) {
-    return sendError(res, error, "DELETE /api/cheque-vouchers/:id:");
-  }
+    connection = await getConnection();
+    await runQuery(connection,"START TRANSACTION");
+    const locked = await runQuery(connection,'SELECT id FROM cheque_vouchers WHERE id = ? FOR UPDATE',[id]);
+    if (!locked.length) throw httpError('Cheque voucher nahi mila.',404);
+    await unlinkCashbookPayments(connection,id);
+    await runQuery(connection, 'DELETE FROM cheque_voucher_payments WHERE cheque_voucher_id = ?', [id]);
+    await runQuery(connection, 'DELETE FROM cheque_vouchers WHERE id = ?', [id]);
+    await runQuery(connection,"COMMIT");
+    return res.json({success:true,message:'Cheque voucher delete ho gaya.'});
+  } catch(error) {
+    if (connection) await runQuery(connection,"ROLLBACK").catch(()=>{});
+    return sendError(res,error,'DELETE /api/cheque-vouchers/:id:');
+  } finally { connection?.release?.(); }
 });
 
 module.exports = router;
