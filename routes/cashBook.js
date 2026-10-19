@@ -222,7 +222,6 @@ async function getLookups(connection) {
         SELECT
           id,
           customer_name_en,
-          phone,
           city_en,
           customer_name_en AS display_name
         FROM customers
@@ -252,7 +251,6 @@ async function getLookups(connection) {
         SELECT
           id,
           supplier_name,
-          phone,
           supplier_name AS display_name
         FROM suppliers
         ORDER BY supplier_name ASC
@@ -264,7 +262,6 @@ async function getLookups(connection) {
         SELECT
           id,
           full_name,
-          phone,
           designation,
           full_name AS display_name
         FROM employees
