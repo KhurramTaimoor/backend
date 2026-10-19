@@ -54,7 +54,7 @@ async function wagesByEmployee(from, to) {
 async function cashByEmployee(from, to) {
   const records = await query(`
     SELECT cbvi.account_id AS employee_id,
-           ROUND(COALESCE(SUM(cbvi.paid),0),2) AS paid,
+           ROUND(COALESCE(SUM(CASE WHEN LOWER(COALESCE(cbvi.description,'')) LIKE '%advance%' OR COALESCE(cbvi.description,'') LIKE '%ایڈوانس%' THEN cbvi.paid ELSE 0 END),0),2) AS paid,
            ROUND(COALESCE(SUM(cbvi.receive),0),2) AS received
     FROM cash_book_voucher_items cbvi
     JOIN cash_book_vouchers cbv ON cbv.id = cbvi.voucher_id
@@ -154,7 +154,7 @@ router.get('/', async (req, res) => {
       unpaid_count:rows.filter(r=>r.status!=='Paid').length,
     };
     res.json({success:true, from_date:from,to_date:to, summary, data:rows,
-      note:'Advance is employee-account Paid from Cash Book during the selected period. Previous Balance uses earlier production wages, cash, employee JV and cheque ledger movements; mirrored legacy cash and linked cheque cash rows are excluded.'});
+      note:'Advance is employee-account Paid cashbook lines explicitly marked Advance/ایڈوانس during the selected period. Previous Balance uses earlier production wages, cash, employee JV and cheque ledger movements; mirrored legacy cash and linked cheque cash rows are excluded.'});
   } catch(error) {
     res.status(error.status||500).json({success:false,message:error.message});
   }
