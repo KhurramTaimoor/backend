@@ -9,7 +9,7 @@ const optionsOf = (v) => { try { const x = typeof v === "string" ? JSON.parse(v)
 const label = (v) => str(v) || "—";
 function bestValuationRate(rows, listName, productId, meta, item) {
   const candidates = rows.filter(r => String(r.product_id) === String(productId) && str(r.list_name || "Default Rate List") === listName);
-  let choice = null, score = -1;
+  let choice = null, score = -Infinity;
   for (const row of candidates) for (const opt of optionsOf(row.price_options)) {
     // Evaluation in the existing customer rate-list editor is stored in wholesale_rate.
     const rate = Number(opt.wholesale_rate);
