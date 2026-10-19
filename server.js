@@ -161,6 +161,7 @@ const salesReturnRoutes =
 
 const salesReportRoutes =
   require("./routes/salesReport");
+const valuationReportRoutes = require("./routes/valuationReport");
 
 /*
 |--------------------------------------------------------------------------
@@ -436,6 +437,7 @@ app.use(
   "/api/sales-report",
   salesReportRoutes
 );
+app.use("/api/valuation-report", valuationReportRoutes);
 
 /*
 |--------------------------------------------------------------------------
