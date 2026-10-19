@@ -236,6 +236,8 @@ const employeesRoutes =
 const employeeRatesRoutes =
   require("./routes/employeeRates");
 
+const payrollRoutes = require("./routes/payroll");
+
 const hrReportsRoutes =
   require("./routes/hrReports");
 
@@ -540,6 +542,8 @@ app.use(
   "/api/employee-rates",
   employeeRatesRoutes
 );
+
+app.use("/api/payroll", payrollRoutes);
 
 app.use(
   "/api/hr-reports",
