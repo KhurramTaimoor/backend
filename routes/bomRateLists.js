@@ -44,7 +44,7 @@ async function load(c,id){
 async function insertVersion(c,listId,raw,note){
  const items=normalizeItems(raw);
  await checkProducts(c,items);
- const [last]=await q(c,"SELECT COALESCE(MAX(version_no),0) AS latest FROM bom_rate_versions WHERE list_id=? FOR UPDATE",[listId]);
+ const [last]=await q(c,"SELECT COALESCE(MAX(version_no),0) AS latest FROM bom_rate_versions WHERE list_id=?",[listId]);
  const versionNo=Number(last.latest)+1;
  const v=await q(c,"INSERT INTO bom_rate_versions(list_id,version_no,variation_note) VALUES(?,?,?)",[listId,versionNo,clean(note)]);
  for(const x of items)await q(c,"INSERT INTO bom_rate_items(version_id,product_id,rate) VALUES(?,?,?)",[v.insertId,x.product_id,x.rate]);
