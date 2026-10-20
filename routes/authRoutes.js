@@ -43,22 +43,26 @@ async function ensureUsersTable() {
     INDEX idx_app_users_employee(employee_id), INDEX idx_app_users_role(role)
   ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`);
 
-  const adminEmail = process.env.ADMIN_EMAIL || 'Alicage061@gmail.com';
-  const adminPassword = process.env.ADMIN_PASSWORD || 'Alicage123';
-  const existing = await query('SELECT id FROM app_users WHERE LOWER(email)=LOWER(?) OR LOWER(username)=LOWER(?) LIMIT 1', [adminEmail, 'admin']);
-  if (!existing.length) {
-    await query(
-      `INSERT INTO app_users (name, username, email, password_hash, role, status)
-       VALUES (?, ?, ?, ?, 'admin', 'active')`,
-      ['Admin', 'admin', adminEmail, hashPassword(adminPassword)]
-    );
+  // Never auto-create an administrator with a publicly known password.
+  // On first installation, configure ADMIN_EMAIL and a unique ADMIN_PASSWORD.
+  const adminEmail = String(process.env.ADMIN_EMAIL || '').trim().toLowerCase();
+  const adminPassword = process.env.ADMIN_PASSWORD || '';
+  if (adminEmail && adminPassword.length >= 12) {
+    const existing = await query('SELECT id FROM app_users WHERE LOWER(email)=LOWER(?) OR LOWER(username)=LOWER(?) LIMIT 1', [adminEmail, 'admin']);
+    if (!existing.length) {
+      await query(
+        `INSERT INTO app_users (name, username, email, password_hash, role, status)
+         VALUES (?, ?, ?, ?, 'admin', 'active')`,
+        ['Admin', 'admin', adminEmail, hashPassword(adminPassword)]
+      );
+    }
   }
 }
 
 router.post('/login', async (req, res) => {
   try {
     await ensureUsersTable();
-    const identifier = String(req.body.identifier || req.body.email || req.body.username || '').trim();
+    const identifier = String(req.body.identifier || req.body.email || req.body.username || '').trim().toLowerCase();
     const password = String(req.body.password || '');
     if (!identifier || !password) {
       return res.status(400).json({ success: false, message: 'Email/username and password are required' });
@@ -83,11 +87,23 @@ router.post('/login', async (req, res) => {
       email: user.email,
       role: String(user.role || 'employee').toLowerCase(),
     };
+    // Only explicitly granted features are available to non-administrator users.
+    let permissions = [];
+    try {
+      const rows = await query("SELECT feature_key,can_read,can_write,can_delete FROM user_feature_permissions WHERE app_user_id=?", [user.id]);
+      permissions = rows.filter(x => x.can_read || x.can_write || x.can_delete).map(x => ({
+        feature_key:x.feature_key,can_read:!!x.can_read,can_write:!!x.can_write,can_delete:!!x.can_delete
+      }));
+    } catch (permissionError) {
+      // Never grant implicit access if the permissions table is not installed yet.
+      console.warn("User feature permissions not ready:", permissionError.code || permissionError.message);
+    }
+    safeUser.permissions = permissions;
     const token = sign(safeUser);
     return res.json({ success: true, message: 'Login successful', token, user: safeUser });
   } catch (error) {
     console.error('Auth login:', error);
-    return res.status(500).json({ success: false, message: 'Login service unavailable', error: error.message });
+    return res.status(500).json({ success: false, message: 'Login service unavailable. Check database migration and configuration.' });
   }
 });
 
@@ -167,12 +183,17 @@ router.post('/change-password', authMiddleware, async (req, res) => {
   }
 });
 
-router.get('/me', async (req, res) => {
-  const authHeader = req.headers.authorization || '';
-  const { verify } = require('../lib/authToken');
-  const user = authHeader.startsWith('Bearer ') ? verify(authHeader.slice(7)) : null;
-  if (!user) return res.status(401).json({ success: false, message: 'Invalid session' });
-  return res.json({ success: true, user });
+router.get('/me', authMiddleware, async (req, res) => {
+  try {
+    const rows = await query("SELECT id,employee_id,name,username,email,role,status FROM app_users WHERE id=? LIMIT 1",[req.user.id]);
+    const user=rows[0];
+    if(!user||String(user.status).toLowerCase()!=="active")
+      return res.status(401).json({success:false,message:"Account is disabled or no longer exists."});
+    const permissions = String(user.role).toLowerCase()==="admin" ? [] :
+      await query("SELECT feature_key,can_read,can_write,can_delete FROM user_feature_permissions WHERE app_user_id=?",[user.id])
+        .catch(()=>[]);
+    return res.json({success:true,user:{id:user.id,employee_id:user.employee_id,name:user.name,username:user.username,email:user.email,role:String(user.role).toLowerCase(),permissions:permissions.map(p=>({feature_key:p.feature_key,can_read:!!p.can_read,can_write:!!p.can_write,can_delete:!!p.can_delete}))}});
+  }catch(error){console.error("Auth session:",error);return res.status(500).json({success:false,message:"Could not verify session."})}
 });
 
 router.ensureUsersTable = ensureUsersTable;
