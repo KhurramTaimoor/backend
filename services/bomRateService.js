@@ -34,8 +34,8 @@ async function repriceExistingBoms(connection,listId){
  "JOIN bom_rate_lists rl ON rl.id=b.rate_list_id",
  "JOIN bom_rate_items ri ON ri.version_id=rl.active_version_id AND ri.product_id=bi.product_id",
  "SET bi.rate=ri.rate,",
- "bi.material_cost=ROUND(COALESCE(bi.effective_qty,bi.qty,0)*ri.rate+COALESCE(bi.extra_charges,0),2),",
- "bi.total=ROUND(COALESCE(bi.effective_qty,bi.qty,0)*ri.rate+COALESCE(bi.extra_charges,0),2)",
+ "bi.material_cost=ROUND(COALESCE(NULLIF(bi.effective_qty,0),bi.qty,0)*ri.rate+COALESCE(bi.extra_charges,0),2),",
+ "bi.total=ROUND(COALESCE(NULLIF(bi.effective_qty,0),bi.qty,0)*ri.rate+COALESCE(bi.extra_charges,0),2)",
  "WHERE b.rate_list_id=?"
  ].join(" ");
  await q(connection,updateItems,[id]);
