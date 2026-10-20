@@ -52,9 +52,15 @@ const permsFromBody=body=>{
  return [...map.values()];
 };
 async function save(req,res,editing=false){
+ let connection=null;
+ let inTransaction=false;
  try{
+  connection=await new Promise((resolve,reject)=>db.getConnection((error,conn)=>error?reject(error):resolve(conn)));
+  const qtx=(sql,params=[])=>new Promise((resolve,reject)=>connection.query(sql,params,(error,rows)=>error?reject(error):resolve(rows)));
+  await new Promise((resolve,reject)=>connection.beginTransaction(error=>error?reject(error):resolve()));
+  inTransaction=true;
   const employeeId=Number(req.body.employee_id);
-  const [employee]=await q("SELECT id,full_name FROM employees WHERE id=? LIMIT 1",[employeeId]);
+  const [employee]=await qtx("SELECT id,full_name FROM employees WHERE id=? LIMIT 1",[employeeId]);
   if(!employee)throw err("Valid employee is required. Please Add Employee first.");
   const role=str(req.body.role).toLowerCase();
   if(!["admin","manager","employee"].includes(role))throw err("Select Admin, Manager or Employee.");
@@ -62,45 +68,54 @@ async function save(req,res,editing=false){
   if(!["active","inactive"].includes(status))throw err("Invalid login status.");
   const email=str(req.body.email).toLowerCase();
   if(email&&!validEmail(email))throw err("Enter a valid login email.");
-  const existing=(await q("SELECT * FROM app_users WHERE employee_id=? LIMIT 1",[employeeId]))[0];
+  const existing=(await qtx("SELECT * FROM app_users WHERE employee_id=? LIMIT 1",[employeeId]))[0];
   if(editing){
-   const [permission]=await q("SELECT id,COALESCE(employee_id,user_id) AS employee_id FROM user_permissions WHERE id=?",[req.params.id]);
+   const [permission]=await qtx("SELECT id,COALESCE(employee_id,user_id) AS employee_id FROM user_permissions WHERE id=?",[req.params.id]);
    if(!permission)throw err("Permission record not found.",404);
    if(Number(permission.employee_id)!==employeeId)throw err("Changing the linked employee is not allowed. Create a new account.");
-  }else if(existing)throw err("Employee already has a login. Edit that account instead.",409);
+  }else if(existing){
+    // An earlier failed save may have created app_users but not user_permissions.
+    // Allow the administrator to finish that incomplete setup without deleting it.
+    const existingPermission=await qtx("SELECT id FROM user_permissions WHERE COALESCE(employee_id,user_id)=? LIMIT 1",[employeeId]);
+    if(existingPermission.length)throw err("Employee already has a login. Edit that account instead.",409);
+  }
   const username=str(req.body.username).toLowerCase()||(existing?.username)||email;
   if(!username)throw err("Enter username or email.");
   if(username.length>120)throw err("Username is too long.");
   const password=String(req.body.password||"");
   if((!existing&&!password)||(password&&(password.length<8||password.length>128)))throw err("New password must be between 8 and 128 characters.");
   const features=permsFromBody(req.body);
-  const conflicts=await q("SELECT id FROM app_users WHERE (LOWER(username)=? OR (email IS NOT NULL AND LOWER(email)=?)) AND employee_id<>? LIMIT 1",[username,email||"---",employeeId]);
+  const conflicts=await qtx("SELECT id FROM app_users WHERE (LOWER(username)=? OR (email IS NOT NULL AND LOWER(email)=?)) AND employee_id<>? LIMIT 1",[username,email||"---",employeeId]);
   if(conflicts.length)throw err("Username or email is already used by another account.",409);
   let userId;
   if(existing){
    userId=existing.id;
-   if(password)await q("UPDATE app_users SET name=?,username=?,email=?,password_hash=?,role=?,status=? WHERE id=?",[employee.full_name,username,email||null,hashPassword(password),role,status,userId]);
-   else await q("UPDATE app_users SET name=?,username=?,email=?,role=?,status=? WHERE id=?",[employee.full_name,username,email||null,role,status,userId]);
+   if(password)await qtx("UPDATE app_users SET name=?,username=?,email=?,password_hash=?,role=?,status=? WHERE id=?",[employee.full_name,username,email||null,hashPassword(password),role,status,userId]);
+   else await qtx("UPDATE app_users SET name=?,username=?,email=?,role=?,status=? WHERE id=?",[employee.full_name,username,email||null,role,status,userId]);
   }else{
-   const r=await q("INSERT INTO app_users(employee_id,name,username,email,password_hash,role,status) VALUES (?,?,?,?,?,?,?)",[employeeId,employee.full_name,username,email||null,hashPassword(password),role,status]);
+   const r=await qtx("INSERT INTO app_users(employee_id,name,username,email,password_hash,role,status) VALUES (?,?,?,?,?,?,?)",[employeeId,employee.full_name,username,email||null,hashPassword(password),role,status]);
    userId=r.insertId;
   }
   let permId=Number(req.params?.id)||0;
   const accessLevel=str(req.body.access_level)||"Custom";
   const summary=features.map(f=>f.feature_key).join(",");
   if(editing){
-   await q("UPDATE user_permissions SET role=?,access_level=?,module_access=? WHERE id=?",[role,accessLevel,summary.slice(0,255),permId]);
+   await qtx("UPDATE user_permissions SET role=?,access_level=?,module_access=? WHERE id=?",[role,accessLevel,summary.slice(0,255),permId]);
   }else{
-   const r=await q("INSERT INTO user_permissions(employee_id,user_id,role,access_level,module_access) VALUES (?,?,?,?,?)",[employeeId,employeeId,role,accessLevel,summary.slice(0,255)]);
+   const r=await qtx("INSERT INTO user_permissions(employee_id,user_id,role,access_level,module_access) VALUES (?,?,?,?,?)",[employeeId,employeeId,role,accessLevel,summary.slice(0,255)]);
    permId=r.insertId;
   }
-  await q("DELETE FROM user_feature_permissions WHERE app_user_id=?",[userId]);
-  for(const f of features)await q("INSERT INTO user_feature_permissions(app_user_id,feature_key,can_read,can_write,can_delete) VALUES(?,?,?,?,?)",[userId,f.feature_key,Number(f.can_read),Number(f.can_write),Number(f.can_delete)]);
+  await qtx("DELETE FROM user_feature_permissions WHERE app_user_id=?",[userId]);
+  for(const f of features)await qtx("INSERT INTO user_feature_permissions(app_user_id,feature_key,can_read,can_write,can_delete) VALUES(?,?,?,?,?)",[userId,f.feature_key,Number(f.can_read),Number(f.can_write),Number(f.can_delete)]);
+  await new Promise((resolve,reject)=>connection.commit(error=>error?reject(error):resolve()));
+  inTransaction=false;
   res.json({success:true,message:editing?"User login and module permissions updated.":"User login and module permissions created.",id:permId,app_user_id:userId});
  }catch(e){
+  if(inTransaction&&connection)await new Promise(resolve=>connection.rollback(()=>resolve()));
   const status=e.code==="ER_DUP_ENTRY"?409:e.status||500;
-  res.status(status).json({success:false,error:e.code==="ER_DUP_ENTRY"?"Username or email already exists.":e.message});
- }
+  console.error("User account permission save error:",e.code||e.message);
+  res.status(status).json({success:false,error:e.code==="ER_DUP_ENTRY"?"Username or email already exists.":status===500?"Could not save user account. Please check database migration.":e.message});
+ }finally{if(connection)connection.release();}
 }
 router.post("/",(req,res)=>save(req,res,false));
 router.put("/:id",(req,res)=>save(req,res,true));
