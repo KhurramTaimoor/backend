@@ -1,111 +1,120 @@
-const express = require('express');
-const crypto = require('crypto');
+const express = require("express");
+const crypto = require("crypto");
 const router = express.Router();
-const db = require('../db');
-const authMiddleware = require('../Middleware/authMiddleware');
+const db = require("../db");
+const authMiddleware = require("../Middleware/authMiddleware");
+const { GROUPS, keys:validKeys } = require("../lib/featureCatalog");
+const q=(sql,params=[])=>new Promise((resolve,reject)=>db.query(sql,params,(e,r)=>e?reject(e):resolve(r)));
+const str=v=>String(v==null?"":v).trim();
+const err=(message,status=400)=>Object.assign(new Error(message),{status});
+const validEmail=s=>/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(s);
 
-const query = (sql, params=[]) => new Promise((resolve,reject)=>db.query(sql,params,(err,rows)=>err?reject(err):resolve(rows)));
-const text = v => String(v ?? '').trim();
-
-function hashPassword(password, salt = crypto.randomBytes(16).toString('hex')) {
-  const hash = crypto.scryptSync(String(password), salt, 64).toString('hex');
-  return `${salt}:${hash}`;
+function hashPassword(value,salt=crypto.randomBytes(16).toString("hex")){
+  return salt+":"+crypto.scryptSync(String(value),salt,64).toString("hex");
 }
-
+let schemaPromise=null;
 async function ensureSchema(){
-  await query(`CREATE TABLE IF NOT EXISTS user_permissions (
-    id INT AUTO_INCREMENT PRIMARY KEY, employee_id INT NULL, user_id INT NULL, role_id INT NULL, role VARCHAR(50) NULL,
-    access_level VARCHAR(50) NULL, module_access VARCHAR(255) NULL, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-  ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`);
-  const cols=new Set((await query('SHOW COLUMNS FROM user_permissions')).map(r=>r.Field));
-  const adds={employee_id:'INT NULL',user_id:'INT NULL',role_id:'INT NULL',role:'VARCHAR(50) NULL',access_level:'VARCHAR(50) NULL',module_access:'VARCHAR(255) NULL'};
-  for(const [c,d] of Object.entries(adds)) if(!cols.has(c)) await query(`ALTER TABLE user_permissions ADD COLUMN \`${c}\` ${d}`);
-
-  await query(`CREATE TABLE IF NOT EXISTS app_users (
-    id INT AUTO_INCREMENT PRIMARY KEY, employee_id INT NULL, name VARCHAR(180) NOT NULL, username VARCHAR(120) NOT NULL UNIQUE,
-    email VARCHAR(180) NULL UNIQUE, password_hash VARCHAR(255) NOT NULL, role VARCHAR(50) NOT NULL DEFAULT 'employee',
-    status VARCHAR(30) NOT NULL DEFAULT 'active', last_login_at DATETIME NULL, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-    INDEX idx_app_users_employee(employee_id), INDEX idx_app_users_role(role)
-  ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`);
+ if(schemaPromise)return schemaPromise;
+ schemaPromise=(async()=>{
+  await q("CREATE TABLE IF NOT EXISTS app_users (id INT AUTO_INCREMENT PRIMARY KEY,employee_id INT NULL,name VARCHAR(180) NOT NULL,username VARCHAR(120) NOT NULL UNIQUE,email VARCHAR(180) NULL UNIQUE,password_hash VARCHAR(255) NOT NULL,role VARCHAR(50) NOT NULL DEFAULT 'employee',status VARCHAR(30) NOT NULL DEFAULT 'active',last_login_at DATETIME NULL,created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,INDEX idx_app_users_employee(employee_id),INDEX idx_app_users_role(role)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4");
+  await q("CREATE TABLE IF NOT EXISTS user_permissions (id INT AUTO_INCREMENT PRIMARY KEY,employee_id INT NULL,user_id INT NULL,role_id INT NULL,role VARCHAR(50) NULL,access_level VARCHAR(50) NULL,module_access VARCHAR(255) NULL,created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4");
+  const cols=new Set((await q("SHOW COLUMNS FROM user_permissions")).map(c=>c.Field));
+  const additions={employee_id:"INT NULL",user_id:"INT NULL",role:"VARCHAR(50) NULL",access_level:"VARCHAR(50) NULL",module_access:"VARCHAR(255) NULL"};
+  for(const [name,type] of Object.entries(additions))if(!cols.has(name))await q("ALTER TABLE user_permissions ADD COLUMN "+name+" "+type);
+  await q("CREATE TABLE IF NOT EXISTS user_feature_permissions (id BIGINT AUTO_INCREMENT PRIMARY KEY,app_user_id INT NOT NULL,feature_key VARCHAR(110) NOT NULL,can_read TINYINT(1) NOT NULL DEFAULT 0,can_write TINYINT(1) NOT NULL DEFAULT 0,can_delete TINYINT(1) NOT NULL DEFAULT 0,created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,UNIQUE KEY uq_user_feature(app_user_id,feature_key),KEY idx_user_feature_key(feature_key)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4");
+ })().catch(e=>{schemaPromise=null;throw e});
+ return schemaPromise;
 }
-router.use(async(_req,res,next)=>{try{await ensureSchema();next();}catch(e){res.status(500).json({error:e.message});}});
+router.use(async(_req,res,next)=>{try{await ensureSchema();next()}catch(e){res.status(500).json({success:false,error:"Permission schema unavailable"})}});
 router.use(authMiddleware);
-router.use((req,res,next)=> String(req.user?.role || '').toLowerCase()==='admin' ? next() : res.status(403).json({error:'Admin access required'}));
-
-router.get('/users', async (_req,res)=>{
-  try{res.json(await query('SELECT id, full_name, phone FROM employees ORDER BY full_name ASC'));}
-  catch(e){res.status(500).json({error:e.message});}
+router.use((req,res,next)=>String(req.user?.role||"").toLowerCase()==="admin"?next():res.status(403).json({success:false,error:"Admin access required"}));
+router.get("/features",(_req,res)=>res.json({success:true,data:Object.entries(GROUPS).map(([group,items])=>({group,items:items.map(([key,label])=>({key:group+"."+key,label}))}))}));
+router.get("/users",async(_req,res)=>{try{res.json(await q("SELECT id,full_name FROM employees ORDER BY full_name ASC"))}catch(e){res.status(500).json({error:e.message})}});
+router.get("/",async(_req,res)=>{
+ try{
+  const users=await q("SELECT au.id AS app_user_id,au.employee_id,au.name AS user_name,au.username,au.email,au.role,au.status,au.last_login_at,up.id AS id,up.access_level,up.module_access FROM app_users au LEFT JOIN user_permissions up ON up.id=(SELECT MAX(sub.id) FROM user_permissions sub WHERE COALESCE(sub.employee_id,sub.user_id)=au.employee_id) WHERE au.employee_id IS NOT NULL ORDER BY au.id DESC");
+  const grants=await q("SELECT app_user_id,feature_key,can_read,can_write,can_delete FROM user_feature_permissions WHERE can_read=1 OR can_write=1 OR can_delete=1");
+  const map=new Map();
+  grants.forEach(g=>{const id=Number(g.app_user_id);if(!map.has(id))map.set(id,[]);map.get(id).push({feature_key:g.feature_key,can_read:!!g.can_read,can_write:!!g.can_write,can_delete:!!g.can_delete})});
+  res.json(users.map(u=>({...u,id:u.id||null,features:map.get(Number(u.app_user_id))||[]})));
+ }catch(e){res.status(500).json({success:false,error:e.message})}
 });
-
-router.get('/', async (_req,res)=>{
-  try{
-    const rows=await query(`SELECT up.id, COALESCE(up.employee_id,up.user_id) AS employee_id, COALESCE(e.full_name,au.name,'Unknown User') AS user_name,
-      COALESCE(up.role,au.role,CONCAT('Role-',up.role_id)) AS role, up.access_level, up.module_access,
-      au.id AS app_user_id, au.username, au.email, au.status, au.last_login_at
-      FROM user_permissions up
-      LEFT JOIN employees e ON e.id=COALESCE(up.employee_id,up.user_id)
-      LEFT JOIN app_users au ON au.employee_id=COALESCE(up.employee_id,up.user_id)
-      ORDER BY up.id DESC`);
-    res.json(rows);
-  }catch(e){res.status(500).json({error:e.message});}
-});
-
-async function employeeName(employeeId){
-  const rows=await query('SELECT full_name FROM employees WHERE id=? LIMIT 1',[employeeId]);
-  return text(rows[0]?.full_name) || `User ${employeeId}`;
-}
-
-async function saveLogin({employee_id,username,email,password,role,status}, editing=false){
-  const existing=await query('SELECT * FROM app_users WHERE employee_id=? LIMIT 1',[employee_id]);
-  const name=await employeeName(employee_id);
-  if(existing.length){
-    const u=existing[0];
-    const nextUsername=text(username)||u.username;
-    const nextEmail=text(email)||null;
-    const nextStatus=text(status)||u.status||'active';
-    const nextRole=text(role).toLowerCase()||u.role||'employee';
-    if(password){
-      await query('UPDATE app_users SET name=?,username=?,email=?,password_hash=?,role=?,status=? WHERE id=?',[name,nextUsername,nextEmail,hashPassword(password),nextRole,nextStatus,u.id]);
-    }else{
-      await query('UPDATE app_users SET name=?,username=?,email=?,role=?,status=? WHERE id=?',[name,nextUsername,nextEmail,nextRole,nextStatus,u.id]);
-    }
-    return u.id;
+const permsFromBody=body=>{
+ if(!Array.isArray(body.features))throw err("Please select individual module permissions.");
+ const map=new Map();
+ for(const x of body.features){
+  const key=str(x.feature_key);
+  if(!validKeys.has(key))throw err("Invalid module: "+key);
+  const read=!!x.can_read,write=!!x.can_write,del=!!x.can_delete;
+  if(read||write||del)map.set(key,{feature_key:key,can_read:read||write||del,can_write:write||del,can_delete:del});
+ }
+ if(!map.size)throw err("Select at least one module.");
+ return [...map.values()];
+};
+async function save(req,res,editing=false){
+ try{
+  const employeeId=Number(req.body.employee_id);
+  const [employee]=await q("SELECT id,full_name FROM employees WHERE id=? LIMIT 1",[employeeId]);
+  if(!employee)throw err("Valid employee is required. Please Add Employee first.");
+  const role=str(req.body.role).toLowerCase();
+  if(!["admin","manager","employee"].includes(role))throw err("Select Admin, Manager or Employee.");
+  const status=str(req.body.status).toLowerCase()||"active";
+  if(!["active","inactive"].includes(status))throw err("Invalid login status.");
+  const email=str(req.body.email).toLowerCase();
+  if(email&&!validEmail(email))throw err("Enter a valid login email.");
+  const existing=(await q("SELECT * FROM app_users WHERE employee_id=? LIMIT 1",[employeeId]))[0];
+  if(editing){
+   const [permission]=await q("SELECT id,COALESCE(employee_id,user_id) AS employee_id FROM user_permissions WHERE id=?",[req.params.id]);
+   if(!permission)throw err("Permission record not found.",404);
+   if(Number(permission.employee_id)!==employeeId)throw err("Changing the linked employee is not allowed. Create a new account.");
+  }else if(existing)throw err("Employee already has a login. Edit that account instead.",409);
+  const username=str(req.body.username).toLowerCase()||(existing?.username)||email;
+  if(!username)throw err("Enter username or email.");
+  if(username.length>120)throw err("Username is too long.");
+  const password=String(req.body.password||"");
+  if((!existing&&!password)||(password&&(password.length<8||password.length>128)))throw err("New password must be between 8 and 128 characters.");
+  const features=permsFromBody(req.body);
+  const conflicts=await q("SELECT id FROM app_users WHERE (LOWER(username)=? OR (email IS NOT NULL AND LOWER(email)=?)) AND employee_id<>? LIMIT 1",[username,email||"---",employeeId]);
+  if(conflicts.length)throw err("Username or email is already used by another account.",409);
+  let userId;
+  if(existing){
+   userId=existing.id;
+   if(password)await q("UPDATE app_users SET name=?,username=?,email=?,password_hash=?,role=?,status=? WHERE id=?",[employee.full_name,username,email||null,hashPassword(password),role,status,userId]);
+   else await q("UPDATE app_users SET name=?,username=?,email=?,role=?,status=? WHERE id=?",[employee.full_name,username,email||null,role,status,userId]);
+  }else{
+   const r=await q("INSERT INTO app_users(employee_id,name,username,email,password_hash,role,status) VALUES (?,?,?,?,?,?,?)",[employeeId,employee.full_name,username,email||null,hashPassword(password),role,status]);
+   userId=r.insertId;
   }
-  if(!text(username) || !password) throw Object.assign(new Error('New user ke liye username aur password required hain.'),{status:400});
-  const result=await query('INSERT INTO app_users (employee_id,name,username,email,password_hash,role,status) VALUES (?,?,?,?,?,?,?)',[
-    employee_id,name,text(username),text(email)||null,hashPassword(password),text(role).toLowerCase()||'employee',text(status)||'active'
-  ]);
-  return result.insertId;
+  let permId=Number(req.params?.id)||0;
+  const accessLevel=str(req.body.access_level)||"Custom";
+  const summary=features.map(f=>f.feature_key).join(",");
+  if(editing){
+   await q("UPDATE user_permissions SET role=?,access_level=?,module_access=? WHERE id=?",[role,accessLevel,summary.slice(0,255),permId]);
+  }else{
+   const r=await q("INSERT INTO user_permissions(employee_id,user_id,role,access_level,module_access) VALUES (?,?,?,?,?)",[employeeId,employeeId,role,accessLevel,summary.slice(0,255)]);
+   permId=r.insertId;
+  }
+  await q("DELETE FROM user_feature_permissions WHERE app_user_id=?",[userId]);
+  for(const f of features)await q("INSERT INTO user_feature_permissions(app_user_id,feature_key,can_read,can_write,can_delete) VALUES(?,?,?,?,?)",[userId,f.feature_key,Number(f.can_read),Number(f.can_write),Number(f.can_delete)]);
+  res.json({success:true,message:editing?"User login and module permissions updated.":"User login and module permissions created.",id:permId,app_user_id:userId});
+ }catch(e){
+  const status=e.code==="ER_DUP_ENTRY"?409:e.status||500;
+  res.status(status).json({success:false,error:e.code==="ER_DUP_ENTRY"?"Username or email already exists.":e.message});
+ }
 }
-
-router.post('/', async (req,res)=>{
-  try{
-    const {employee_id,role,access_level,module_access,username,email,password,status}=req.body;
-    if(!employee_id||!role||!access_level||!text(module_access)) return res.status(400).json({error:'User, role, access level aur module access required hain.'});
-    await saveLogin({employee_id,username,email,password,role,status});
-    const result=await query('INSERT INTO user_permissions (employee_id,user_id,role,access_level,module_access) VALUES (?,?,?,?,?)',[employee_id,employee_id,role,access_level,text(module_access)]);
-    res.json({message:'Permission aur login save ho gaye!',id:result.insertId});
-  }catch(e){res.status(e.status||500).json({error:e.message});}
+router.post("/",(req,res)=>save(req,res,false));
+router.put("/:id",(req,res)=>save(req,res,true));
+router.delete("/:id",async(req,res)=>{
+ try{
+  const [up]=await q("SELECT COALESCE(employee_id,user_id) AS employee_id FROM user_permissions WHERE id=?",[req.params.id]);
+  if(!up)throw err("User permission not found.",404);
+  const [user]=await q("SELECT id FROM app_users WHERE employee_id=? LIMIT 1",[up.employee_id]);
+  if(user){
+   await q("UPDATE app_users SET status='inactive' WHERE id=?",[user.id]);
+   await q("DELETE FROM user_feature_permissions WHERE app_user_id=?",[user.id]);
+  }
+  await q("DELETE FROM user_permissions WHERE id=?",[req.params.id]);
+  res.json({success:true,message:"Access revoked; login disabled. Employee and audit history preserved."});
+ }catch(e){res.status(e.status||500).json({success:false,error:e.message})}
 });
-
-router.put('/:id', async (req,res)=>{
-  try{
-    const {employee_id,role,access_level,module_access,username,email,password,status}=req.body;
-    if(!employee_id||!role||!access_level||!text(module_access)) return res.status(400).json({error:'User, role, access level aur module access required hain.'});
-    await saveLogin({employee_id,username,email,password,role,status},true);
-    await query('UPDATE user_permissions SET employee_id=?,user_id=?,role=?,access_level=?,module_access=? WHERE id=?',[employee_id,employee_id,role,access_level,text(module_access),req.params.id]);
-    res.json({message:'Permission aur login update ho gaye!'});
-  }catch(e){res.status(e.status||500).json({error:e.message});}
-});
-
-router.delete('/:id', async (req,res)=>{
-  try{
-    const rows=await query('SELECT COALESCE(employee_id,user_id) AS employee_id FROM user_permissions WHERE id=?',[req.params.id]);
-    await query('DELETE FROM user_permissions WHERE id=?',[req.params.id]);
-    if(rows[0]?.employee_id) await query('DELETE FROM app_users WHERE employee_id=?',[rows[0].employee_id]);
-    res.json({message:'Permission aur user login deleted!'});
-  }catch(e){res.status(500).json({error:e.message});}
-});
-
 module.exports=router;
