@@ -300,6 +300,10 @@ app.use(
   authRoutes
 );
 
+// Enforce fresh database-backed module permissions on all non-auth API routes.
+app.use("/api", require("./Middleware/featureAccess"));
+
+
 app.use(
   "/api/transaction-history",
   transactionHistoryRoutes
