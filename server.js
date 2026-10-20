@@ -257,6 +257,7 @@ const contractorRoutes =
 
 const bomRoutes =
   require("./routes/bom");
+const bomRateListRoutes = require("./routes/bomRateLists");
 
 const assemblyRoutes =
   require("./routes/assembly");
@@ -574,6 +575,7 @@ app.use(
   "/api/bom",
   bomRoutes
 );
+app.use("/api/bom-rate-lists", bomRateListRoutes);
 
 app.use(
   "/api/assembly",
