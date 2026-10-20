@@ -303,7 +303,7 @@ CALL ali_cage_add_missing_column('departments','extension_no','VARCHAR(45) NULL'
 
 CALL ali_cage_add_missing_column('designations','designation_name','VARCHAR(180) NULL');
 
-CALL ali_cage_add_missing_column('designations','status','VARCHAR(20) NOT NULL DEFAULT 'Active'');
+CALL ali_cage_add_missing_column('designations','status','VARCHAR(20) NOT NULL DEFAULT ''Active''');
 
 -- Ensure updated columns exist: employees
 
@@ -337,9 +337,9 @@ CALL ali_cage_add_missing_column('app_users','email','VARCHAR(180) NULL');
 
 CALL ali_cage_add_missing_column('app_users','password_hash','VARCHAR(255) NULL');
 
-CALL ali_cage_add_missing_column('app_users','role','VARCHAR(50) NOT NULL DEFAULT 'employee'');
+CALL ali_cage_add_missing_column('app_users','role','VARCHAR(50) NOT NULL DEFAULT ''employee''');
 
-CALL ali_cage_add_missing_column('app_users','status','VARCHAR(30) NOT NULL DEFAULT 'active'');
+CALL ali_cage_add_missing_column('app_users','status','VARCHAR(30) NOT NULL DEFAULT ''active''');
 
 CALL ali_cage_add_missing_column('app_users','last_login_at','DATETIME NULL');
 
@@ -419,9 +419,9 @@ CALL ali_cage_add_missing_column('cash_book_voucher_items','legacy_cash_book_id'
 
 -- Ensure updated columns exist: cheque_vouchers
 
-CALL ali_cage_add_missing_column('cheque_vouchers','account_type','VARCHAR(40) NOT NULL DEFAULT 'general_ledger'');
+CALL ali_cage_add_missing_column('cheque_vouchers','account_type','VARCHAR(40) NOT NULL DEFAULT ''general_ledger''');
 
-CALL ali_cage_add_missing_column('cheque_vouchers','cheque_direction','VARCHAR(12) NOT NULL DEFAULT 'issue'');
+CALL ali_cage_add_missing_column('cheque_vouchers','cheque_direction','VARCHAR(12) NOT NULL DEFAULT ''issue''');
 
 -- Ensure updated columns exist: cheque_voucher_payments
 
@@ -439,11 +439,11 @@ CALL ali_cage_add_missing_column('payroll_period_status','from_date','DATE NULL'
 
 CALL ali_cage_add_missing_column('payroll_period_status','to_date','DATE NULL');
 
-CALL ali_cage_add_missing_column('payroll_period_status','status','ENUM('Paid','Unpaid') NOT NULL DEFAULT 'Unpaid'');
+CALL ali_cage_add_missing_column('payroll_period_status','status','ENUM(''Paid'',''Unpaid'') NOT NULL DEFAULT ''Unpaid''');
 
 -- Ensure updated columns exist: scoped_rate_lists
 
-CALL ali_cage_add_missing_column('scoped_rate_lists','scope','ENUM('supplier','production') NULL');
+CALL ali_cage_add_missing_column('scoped_rate_lists','scope','ENUM(''supplier'',''production'') NULL');
 
 CALL ali_cage_add_missing_column('scoped_rate_lists','list_name','VARCHAR(180) NULL');
 
@@ -451,7 +451,7 @@ CALL ali_cage_add_missing_column('scoped_rate_lists','items_json','LONGTEXT NULL
 
 -- Ensure updated columns exist: scoped_rate_assignments
 
-CALL ali_cage_add_missing_column('scoped_rate_assignments','scope','ENUM('supplier','production') NULL');
+CALL ali_cage_add_missing_column('scoped_rate_assignments','scope','ENUM(''supplier'',''production'') NULL');
 
 CALL ali_cage_add_missing_column('scoped_rate_assignments','entity_id','INT NULL');
 
