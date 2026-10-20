@@ -27,7 +27,7 @@ module.exports=async function featureAccess(req,res,next){
     return res.status(401).json({success:false,message:"User account is inactive or has been removed."});
   const role=String(user.role||"").toLowerCase();
   if(role==="admin"){req.user={...token,role};return next();}
-  const url=req.path.replace(/\/+$/,"");
+  const url=String(req.originalUrl||req.url||"").split("?")[0].replace(/\/+$/,"");
   if([...ADMIN_ONLY].some(p=>isWithin(url,p)))return res.status(403).json({success:false,message:"Administrator access required."});
   const feature=resolveFeature(url);
   const all=await query("SELECT feature_key,can_read,can_write,can_delete FROM user_feature_permissions WHERE app_user_id=?",[user.id]);
