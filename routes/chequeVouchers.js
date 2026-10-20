@@ -395,54 +395,107 @@ router.get("/dashboard", async (req, res) => {
   }
 });
 
+const chequeReportParams = (query = {}) => {
+  const status = cleanText(query.status).toLowerCase();
+  const search = cleanText(query.search);
+  const direction = cleanText(query.direction).toLowerCase();
+  const sort = cleanText(query.sort).toLowerCase();
+  const type = cleanText(query.account_type).toLowerCase();
+  const accountId = cleanText(query.account_id);
+  const from = cleanText(query.from_date);
+  const to = cleanText(query.to_date);
+  const conditions = [], params = [];
+  if (direction && direction !== "all") {
+    if (!["receive", "issue"].includes(direction)) throw httpError("Invalid cheque direction.");
+    conditions.push("cv.cheque_direction = ?");
+    params.push(direction);
+  }
+  if (type && type !== "all") {
+    if (!ACCOUNT_TYPES[type]) throw httpError("Invalid account type.");
+    conditions.push("cv.account_type = ?");
+    params.push(type);
+  }
+  if (accountId) {
+    if (!/^[1-9]\d*$/.test(accountId)) throw httpError("Invalid account ID.");
+    if (!type || type === "all") throw httpError("Select account type for an account name filter.");
+    conditions.push("cv.account_id = ?");
+    params.push(Number(accountId));
+  }
+  const validDate = /^\d{4}-\d{2}-\d{2}$/;
+  if ((from && !validDate.test(from)) || (to && !validDate.test(to)) || (from && to && from > to)) {
+    throw httpError("Invalid date range.");
+  }
+  // Date filters use the cheque date, not the clearing installment dates.
+  if (from) { conditions.push("cv.issuance_date >= ?"); params.push(from); }
+  if (to) { conditions.push("cv.issuance_date <= ?"); params.push(to); }
+  if (search) {
+    conditions.push("(cv.voucher_no LIKE ? OR cv.payee_name LIKE ? OR coa.account_title LIKE ? OR cu.customer_name_en LIKE ? OR su.supplier_name LIKE ? OR em.full_name LIKE ?)");
+    const needle = "%" + search + "%";
+    params.push(needle,needle,needle,needle,needle,needle);
+  }
+  const where = conditions.length ? "WHERE " + conditions.join(" AND ") : "";
+  let having = "";
+  if (status === "cleared") having = "HAVING paid_amount >= cv.total_amount";
+  else if (status === "remaining" || status === "pending") having = "HAVING paid_amount < cv.total_amount";
+  else if (status === "partial") having = "HAVING paid_amount > 0 AND paid_amount < cv.total_amount";
+  const ordering = sort === "newest" ?
+    "ORDER BY cv.issuance_date DESC, cv.id DESC" :
+    [
+      "ORDER BY CASE",
+      "WHEN COALESCE(SUM(cvp.amount),0) < cv.total_amount AND cv.clearance_date >= CURDATE() THEN 0",
+      "WHEN COALESCE(SUM(cvp.amount),0) < cv.total_amount THEN 1",
+      "ELSE 2 END ASC,",
+      "CASE WHEN cv.clearance_date >= CURDATE() THEN cv.clearance_date END ASC,",
+      "cv.clearance_date DESC, cv.id DESC"
+    ].join(" ");
+  return {where,having,ordering,params};
+};
+
+async function listChequeVouchers(query) {
+  const {where,having,ordering,params} = chequeReportParams(query);
+  const rows = await runQuery(db,
+    voucherSelect + " " + where + " " + voucherGroupBy + " " + having + " " + ordering,
+    params
+  );
+  return rows.map(normalizeVoucher);
+}
+
+router.get("/print-report", async (req, res) => {
+  try {
+    await schemaReady;
+    const vouchers = await listChequeVouchers(req.query);
+    const ids = vouchers.map(row => row.id);
+    let payments = [];
+    if (ids.length) {
+      payments = await runQuery(db,
+        [
+          "SELECT cvp.id,cvp.cheque_voucher_id,",
+          "DATE_FORMAT(cvp.payment_date,'%Y-%m-%d') AS payment_date,",
+          "cvp.details,cvp.amount,cbv.voucher_no AS cash_book_voucher_no",
+          "FROM cheque_voucher_payments cvp",
+          "LEFT JOIN cheque_cashbook_links cbl ON cbl.payment_id=cvp.id",
+          "LEFT JOIN cash_book_vouchers cbv ON cbv.id=cbl.cash_book_voucher_id",
+          "WHERE cvp.cheque_voucher_id IN (?)",
+          "ORDER BY cvp.payment_date ASC,cvp.id ASC"
+        ].join(" "), [ids]
+      );
+    }
+    const byId = new Map(ids.map(id => [id, []]));
+    for (const item of payments) {
+      const id = Number(item.cheque_voucher_id);
+      if (byId.has(id)) byId.get(id).push({...item,amount:toAmount(item.amount)});
+    }
+    const data = vouchers.map(voucher => ({...voucher,payments:byId.get(voucher.id) || []}));
+    return res.json({success:true,data,vouchers:data});
+  } catch (error) { return sendError(res,error,"GET /api/cheque-vouchers/print-report:"); }
+});
+
 router.get("/", async (req, res) => {
   try {
     await schemaReady;
-    const status = cleanText(req.query.status).toLowerCase();
-    const search = cleanText(req.query.search);
-    const conditions = [];
-    const params = [];
-
-    if (search) {
-      conditions.push(
-        `(cv.voucher_no LIKE ? OR cv.payee_name LIKE ? OR coa.account_title LIKE ? OR cu.customer_name_en LIKE ?
-          OR su.supplier_name LIKE ? OR em.full_name LIKE ?)`
-      );
-      const needle = `%${search}%`;
-      params.push(needle, needle, needle, needle, needle, needle);
-    }
-
-    const where = conditions.length ? `WHERE ${conditions.join(" AND ")}` : "";
-    let having = "";
-    if (status === "cleared") {
-      having = "HAVING paid_amount >= cv.total_amount";
-    } else if (["remaining", "pending"].includes(status)) {
-      having = "HAVING paid_amount < cv.total_amount";
-    } else if (status === "partial") {
-      having = "HAVING paid_amount > 0 AND paid_amount < cv.total_amount";
-    }
-
-    const rows = await runQuery(
-      db,
-      `${voucherSelect} ${where} ${voucherGroupBy} ${having}
-       ORDER BY
-         CASE
-           WHEN COALESCE(SUM(cvp.amount), 0) < cv.total_amount
-                AND cv.clearance_date >= CURDATE() THEN 0
-           WHEN COALESCE(SUM(cvp.amount), 0) < cv.total_amount THEN 1
-           ELSE 2
-         END ASC,
-         CASE WHEN cv.clearance_date >= CURDATE() THEN cv.clearance_date END ASC,
-         cv.clearance_date DESC,
-         cv.id DESC`,
-      params
-    );
-
-    const data = rows.map(normalizeVoucher);
-    return res.json({ success: true, data, vouchers: data });
-  } catch (error) {
-    return sendError(res, error, "GET /api/cheque-vouchers:");
-  }
+    const data = await listChequeVouchers(req.query);
+    return res.json({success:true,data,vouchers:data});
+  } catch (error) { return sendError(res,error,"GET /api/cheque-vouchers:"); }
 });
 
 router.get("/:id", async (req, res) => {
